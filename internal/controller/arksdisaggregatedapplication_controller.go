@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -385,19 +386,31 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 		}
 
 		needUpdate := false
+
+		// Check Replicas changes
 		if prefillReplicas != *lws.Spec.Replicas {
 			klog.Infof("application %s/%s: prefill replicas changed %d", application.Namespace, application.Name, prefillReplicas)
 			lws.Spec.Replicas = ptr.To(prefillReplicas)
 			needUpdate = true
 		}
 
-		// TODO support update decode command (and runtime args)
+		// Check PodTemplate changes
+		desiredLWS, err := r.generateDisaggregatedLws(application, model, "prefill")
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 
-		// TODO support update podSpec
+		if !reflect.DeepEqual(lws.Spec.LeaderWorkerTemplate, desiredLWS.Spec.LeaderWorkerTemplate) {
+			klog.InfoS("Detected PodTemplate changes for Prefill, triggering rolling update",
+				"application", application.Name,
+				"namespace", application.Namespace)
+			lws.Spec.LeaderWorkerTemplate = desiredLWS.Spec.LeaderWorkerTemplate
+			needUpdate = true
+		}
 
 		if needUpdate {
 			if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Update(ctx, lws, metav1.UpdateOptions{}); err != nil {
-				klog.Errorf("application %s/%s: failed to update prefill lws: %q", application.Namespace, application.Name, err)
+				return ctrl.Result{}, fmt.Errorf("failed to update Prefill LeaderWorkerSet: %w", err)
 			}
 			klog.Infof("application %s/%s: update prefill lws successfully", application.Namespace, application.Name)
 		}
@@ -424,21 +437,33 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 		}
 
 		needUpdate := false
+
+		// Check Replicas changes
 		if decodeReplicas != *lws.Spec.Replicas {
 			klog.Infof("application %s/%s: decode replicas changed %d", application.Namespace, application.Name, decodeReplicas)
 			lws.Spec.Replicas = ptr.To(decodeReplicas)
 			needUpdate = true
 		}
 
-		// TODO support update decode command (and runtime args)
+		// Check PodTemplate changes
+		desiredLWS, err := r.generateDisaggregatedLws(application, model, "decode")
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 
-		// TODO support update podSpec
+		if !reflect.DeepEqual(lws.Spec.LeaderWorkerTemplate, desiredLWS.Spec.LeaderWorkerTemplate) {
+			klog.InfoS("Detected PodTemplate changes for Decode, triggering rolling update",
+				"application", application.Name,
+				"namespace", application.Namespace)
+			lws.Spec.LeaderWorkerTemplate = desiredLWS.Spec.LeaderWorkerTemplate
+			needUpdate = true
+		}
 
 		if needUpdate {
 			if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Update(ctx, lws, metav1.UpdateOptions{}); err != nil {
-				klog.Errorf("application %s/%s: failed to update prefill lws: %q", application.Namespace, application.Name, err)
+				return ctrl.Result{}, fmt.Errorf("failed to update Decode LeaderWorkerSet: %w", err)
 			}
-			klog.Infof("application %s/%s: update prefill lws successfully", application.Namespace, application.Name)
+			klog.Infof("application %s/%s: update decode lws successfully", application.Namespace, application.Name)
 		}
 	}
 
@@ -463,19 +488,32 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 		}
 
 		needUpdate := false
+
+		// Check Replicas changes
 		if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas != routerReplicas {
 			deployment.Spec.Replicas = ptr.To(routerReplicas)
 			needUpdate = true
 		}
 
-		// TODO support update podSpec
+		// Check PodTemplate changes
+		desiredDeployment, err := r.generateRouterDeployment(ctx, application)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if !reflect.DeepEqual(deployment.Spec.Template, desiredDeployment.Spec.Template) {
+			klog.InfoS("Detected PodTemplate changes for Router, triggering update",
+				"application", application.Name,
+				"namespace", application.Namespace)
+			deployment.Spec.Template = desiredDeployment.Spec.Template
+			needUpdate = true
+		}
 
 		if needUpdate {
 			if _, err := r.KubeClient.AppsV1().Deployments(application.Namespace).Update(ctx, deployment, metav1.UpdateOptions{}); err != nil {
-				klog.Errorf("application %s/%s: failed to update router deployment: %q", application.Namespace, application.Name, err)
-				return ctrl.Result{}, fmt.Errorf("failed to update router deployment: %q", err)
+				return ctrl.Result{}, fmt.Errorf("failed to update Router Deployment: %w", err)
 			}
-			klog.Infof("update router deployment successfully")
+			klog.Infof("application %s/%s: update router deployment successfully", application.Namespace, application.Name)
 		}
 	}
 

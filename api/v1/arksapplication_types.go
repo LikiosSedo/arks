@@ -153,7 +153,6 @@ type ArksInstanceSpec struct {
 
 	// Resources define the leader/worker container resources.
 	// +optional
-	// +kubebuilder:validation:Immutable
 	Resources corev1.ResourceRequirements `json:"resources"`
 
 	// Map of string keys and values that can be used to organize and categorize
@@ -173,19 +172,16 @@ type ArksInstanceSpec struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 
 	// +optional
-	// +kubebuilder:validation:Immutable
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// VolumeMounts define the mount point for leader/worker pod.
 	// NOTE: the mount point can not be '/models', it is reserved for ArksModel.
 	// +optional
-	// +kubebuilder:validation:Immutable
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 
 	// Volumes define the extra volumes for leader/worker pod, volume name
 	// can not be 'models', it is reserved for ArksModel.
 	// +optional
-	// +kubebuilder:validation:Immutable
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
 
 	// NodeSelector is a selector which must be true for the pod to fit on a node.
@@ -215,16 +211,13 @@ type ArksInstanceSpec struct {
 
 	// Periodic probe of container liveness.
 	// +optional
-	// +kubebuilder:validation:Immutable
 	LivenessProbe *corev1.Probe `json:"livenessProbe"`
 
 	// Periodic probe of container readiness.
 	// +optional
-	// +kubebuilder:validation:Immutable
 	ReadinessProbe *corev1.Probe `json:"readinessProbe"`
 
 	// +optional
-	// +kubebuilder:validation:Immutable
 	StartupProbe *corev1.Probe `json:"startupProbe,omitempty" protobuf:"bytes,22,opt,name=startupProbe"`
 
 	// +optional

@@ -69,7 +69,6 @@ type ArksDisaggregatedApplicationSpec struct {
 
 	// RouterImage defines the router container image URL.
 	// +optional
-	// +kubebuilder:validation:Immutable
 	RouterImage string `json:"routerImage"`
 
 	// RuntimeImage defines the runtime container image URL.
@@ -77,7 +76,6 @@ type ArksDisaggregatedApplicationSpec struct {
 	// Customized runtime container images must be compatible with the Runtime.
 	// Arks provides a default version of the runtime container image.
 	// +optional
-	// +kubebuilder:validation:Immutable
 	RuntimeImage string `json:"runtimeImage"` // The image of vLLM, SGLang or Dynamo.
 
 	// RuntimeImagePullSecrets defines the runtime image pull secret.
