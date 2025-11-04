@@ -60,6 +60,14 @@ type ArksDisaggregatedWorkload struct {
 
 // ArksDisaggregatedApplicationSpec defines the desired state of ArksDisaggregatedApplication.
 type ArksDisaggregatedApplicationSpec struct {
+	// Backend defines the workload orchestration backend.
+	// Currently supports: lws (LeaderWorkerSet), rbg (RoleBasedGroup).
+	// Default is lws to preserve backward compatibility.
+	// +optional
+	// +kubebuilder:validation:Enum=lws;rbg
+	// +kubebuilder:default=lws
+	Backend ArksBackend `json:"backend,omitempty"`
+
 	// Runtime defines the inference runtime.
 	// Now support: vllm, sglang. Default vLLM.
 	// We will support Dynamo in future.
