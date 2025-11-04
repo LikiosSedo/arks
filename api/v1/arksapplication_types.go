@@ -26,6 +26,8 @@ type ArksRuntime string
 type ArksApplicationPhase string
 type ArksApplicationConditionType string
 
+type ArksBackend string
+
 const (
 	ArksApplicationPhasePending  ArksApplicationPhase = "Pending"
 	ArksApplicationPhaseChecking ArksApplicationPhase = "Checking"
@@ -45,6 +47,10 @@ const (
 	ArksRuntimeVLLM    ArksRuntime = "vllm"
 	ArksRuntimeSGLang  ArksRuntime = "sglang"
 	ArksRuntimeDynamo  ArksRuntime = "dynamo"
+
+	// Backend types for workload orchestration
+	ArksBackendLWS ArksBackend = "lws" // LeaderWorkerSet backend (no rolling update)
+	ArksBackendRBG ArksBackend = "rbg" // RoleBasedGroup backend (supports rolling update)
 )
 
 const (
@@ -272,6 +278,15 @@ type ArksApplicationSpec struct {
 	// You can specify the image pull secrets for the private image registry.
 	// +optional
 	RuntimeImagePullSecrets []corev1.LocalObjectReference `json:"runtimeImagePullSecrets"`
+
+	// Backend defines the workload orchestration backend.
+	// Currently supports: lws (LeaderWorkerSet), rbg (RoleBasedGroup).
+	// Default is lws for backward compatibility.
+	// RBG backend supports rolling updates while LWS does not.
+	// +optional
+	// +kubebuilder:validation:Enum=lws;rbg
+	// +kubebuilder:default=lws
+	Backend ArksBackend `json:"backend,omitempty"`
 
 	Model corev1.LocalObjectReference `json:"model"`
 

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -38,6 +39,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	lwsapi "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	lwscli "sigs.k8s.io/lws/client-go/clientset/versioned"
+	rbgv1alpha1 "sigs.k8s.io/rbgs/api/workloads/v1alpha1"
 
 	arksv1 "github.com/arks-ai/arks/api/v1"
 )
@@ -253,27 +255,65 @@ func (r *ArksApplicationReconciler) reconcile(ctx context.Context, application *
 	// start model service
 	if !checkApplicationCondition(application, arksv1.ArksApplicationReady) {
 		application.Status.Phase = string(arksv1.ArksApplicationPhaseCreating)
-		if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, application.Name, metav1.GetOptions{}); err != nil {
-			if apierrors.IsNotFound(err) {
-				lws, err := generateLws(application, model)
-				if err != nil {
-					application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-					updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "UnderlayGenerateFailed", fmt.Sprintf("Failed to generate underlay: %q", err))
-					return ctrl.Result{}, fmt.Errorf("failed to generate underlying LWS: %q", err)
-				}
-				ctrl.SetControllerReference(application, lws, r.Scheme)
 
-				if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Create(ctx, lws, metav1.CreateOptions{}); err != nil {
-					if !apierrors.IsAlreadyExists(err) {
-						updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayCreatedFailed", fmt.Sprintf("Failed to create underlay: %q", err))
-						klog.Errorf("application %s/%s: failed to create underlying LWS: %q", application.Namespace, application.Name, err)
-						return ctrl.Result{}, fmt.Errorf("failed to create underlying LWS: %q", err)
+		// Determine backend to use
+		backend := application.Spec.Backend
+		if backend == "" {
+			backend = arksv1.ArksBackendLWS // Default to LWS for backward compatibility
+		}
+
+		// Use appropriate backend
+		if backend == arksv1.ArksBackendRBG {
+			// Use RBG backend
+			rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
+			err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: application.Name}, rbgs)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					rbgs, err := generateRBGS(application, model)
+					if err != nil {
+						application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+						updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "UnderlayGenerateFailed", fmt.Sprintf("Failed to generate underlay: %q", err))
+						return ctrl.Result{}, fmt.Errorf("failed to generate underlying RBGS: %q", err)
 					}
+					ctrl.SetControllerReference(application, rbgs, r.Scheme)
+
+					if err := r.Client.Create(ctx, rbgs); err != nil {
+						if !apierrors.IsAlreadyExists(err) {
+							updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayCreatedFailed", fmt.Sprintf("Failed to create underlay: %q", err))
+							klog.Errorf("application %s/%s: failed to create underlying RBGS: %q", application.Namespace, application.Name, err)
+							return ctrl.Result{}, fmt.Errorf("failed to create underlying RBGS: %q", err)
+						}
+					}
+					klog.Infof("application %s/%s: create underlying RBGS successfully", application.Namespace, application.Name)
+				} else {
+					klog.Errorf("application %s/%s: failed to check the underlying RBGS: %q", application.Namespace, application.Name, err)
+					return ctrl.Result{}, fmt.Errorf("failed to check the underlying RBGS: %q", err)
 				}
-				klog.Infof("application %s/%s: create underlying LWS successfully", application.Namespace, application.Name)
-			} else {
-				klog.Errorf("application %s/%s: failed to check the underlying LWS: %q", application.Namespace, application.Name, err)
-				return ctrl.Result{}, fmt.Errorf("failed to check the underlying LWS: %q", err)
+			}
+		} else {
+			// Use LWS backend (default)
+			if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, application.Name, metav1.GetOptions{}); err != nil {
+				if apierrors.IsNotFound(err) {
+					lws, err := generateLws(application, model)
+					if err != nil {
+						application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+						updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "UnderlayGenerateFailed", fmt.Sprintf("Failed to generate underlay: %q", err))
+						return ctrl.Result{}, fmt.Errorf("failed to generate underlying LWS: %q", err)
+					}
+					ctrl.SetControllerReference(application, lws, r.Scheme)
+
+					if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Create(ctx, lws, metav1.CreateOptions{}); err != nil {
+						if !apierrors.IsAlreadyExists(err) {
+							updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayCreatedFailed", fmt.Sprintf("Failed to create underlay: %q", err))
+							klog.Errorf("application %s/%s: failed to create underlying LWS: %q", application.Namespace, application.Name, err)
+							return ctrl.Result{}, fmt.Errorf("failed to create underlying LWS: %q", err)
+						}
+					}
+					klog.Infof("application %s/%s: create underlying LWS successfully", application.Namespace, application.Name)
+				} else {
+					klog.Errorf("application %s/%s: failed to check the underlying LWS: %q", application.Namespace, application.Name, err)
+					return ctrl.Result{}, fmt.Errorf("failed to check the underlying LWS: %q", err)
+				}
 			}
 		}
 
@@ -343,6 +383,7 @@ func (r *ArksApplicationReconciler) reconcile(ctx context.Context, application *
 	return ctrl.Result{}, nil
 }
 
+// GenerateLws generates LeaderWorkerSet for ArksApplication
 func generateLws(application *arksv1.ArksApplication, model *arksv1.ArksModel) (*lwsapi.LeaderWorkerSet, error) {
 	image, err := getApplicationRuntimeImage(application)
 	if err != nil {
@@ -546,6 +587,174 @@ func generateLws(application *arksv1.ArksApplication, model *arksv1.ArksModel) (
 	}
 
 	return lws, nil
+}
+
+func generateRBGS(application *arksv1.ArksApplication, model *arksv1.ArksModel) (*rbgv1alpha1.RoleBasedGroupSet, error) {
+	image, err := getApplicationRuntimeImage(application)
+	if err != nil {
+		return nil, err
+	}
+
+	leaderCommand, err := generateLeaderCommand(application, model)
+	if err != nil {
+		return nil, err
+	}
+
+	workerCommand, err := generateWorkerCommand(application, model)
+	if err != nil {
+		return nil, err
+	}
+
+	rbgsReplicas := int32(application.Spec.Replicas)
+	if rbgsReplicas < 0 {
+		rbgsReplicas = 0
+	}
+	lwsSize := int32(application.Spec.Size)
+	if lwsSize < 1 {
+		lwsSize = 1
+	}
+	klog.Infof("application %s/%s (RBG): replicas %d, size: %d", application.Namespace, application.Name, rbgsReplicas, lwsSize)
+
+	volumes := []corev1.Volume{
+		{
+			Name: arksApplicationModelVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: model.Spec.Storage.PVC.Name,
+				},
+			},
+		},
+	}
+	volumes = append(volumes, application.Spec.InstanceSpec.Volumes...)
+
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      arksApplicationModelVolumeName,
+			MountPath: arksApplicationModelVolumeMountPath,
+			ReadOnly:  true,
+		},
+	}
+	volumeMounts = append(volumeMounts, application.Spec.InstanceSpec.VolumeMounts...)
+
+	envs := []corev1.EnvVar{}
+	envs = append(envs, application.Spec.InstanceSpec.Env...)
+	if application.Spec.Runtime == string(arksv1.ArksRuntimeSGLang) {
+		envs = append(envs, corev1.EnvVar{
+			Name: "LWS_WORKER_INDEX",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']",
+				},
+			},
+		})
+	}
+
+	readinessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromInt32(8080),
+			},
+		},
+		InitialDelaySeconds: 15,
+		PeriodSeconds:       10,
+	}
+	if application.Spec.InstanceSpec.ReadinessProbe != nil {
+		readinessProbe = application.Spec.InstanceSpec.ReadinessProbe
+	}
+
+	livenessProbe := application.Spec.InstanceSpec.LivenessProbe
+
+	// Create the base pod spec
+	podSpec := corev1.PodSpec{
+		ServiceAccountName:            application.Spec.InstanceSpec.ServiceAccountName,
+		SchedulerName:                 application.Spec.InstanceSpec.SchedulerName,
+		Affinity:                      application.Spec.InstanceSpec.Affinity,
+		NodeSelector:                  application.Spec.InstanceSpec.NodeSelector,
+		Tolerations:                   application.Spec.InstanceSpec.Tolerations,
+		TerminationGracePeriodSeconds: application.Spec.InstanceSpec.TerminationGracePeriodSeconds,
+		InitContainers:                application.Spec.InstanceSpec.InitContainers,
+		ImagePullSecrets:              application.Spec.RuntimeImagePullSecrets,
+		Volumes:                       volumes,
+		Containers: []corev1.Container{
+			{
+				Name:            "instance",
+				Image:           image,
+				Command:         leaderCommand, // Will be patched for workers
+				ImagePullPolicy: corev1.PullIfNotPresent,
+				Env:             envs,
+				Resources:       application.Spec.InstanceSpec.Resources,
+				VolumeMounts:    volumeMounts,
+				LivenessProbe:   livenessProbe,
+				ReadinessProbe:  readinessProbe,
+			},
+		},
+	}
+
+	// Create worker patch
+	workerPatch := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:    "instance",
+					Command: workerCommand,
+				},
+			},
+		},
+	}
+
+	workerPatchJSON, err := json.Marshal(workerPatch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal worker patch: %v", err)
+	}
+
+	// Create RoleBasedGroupSet
+	rbgs := &rbgv1alpha1.RoleBasedGroupSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: application.Namespace,
+			Name:      application.Name,
+			Labels: map[string]string{
+				arksv1.ArksControllerKeyApplication: application.Name,
+			},
+		},
+		Spec: rbgv1alpha1.RoleBasedGroupSetSpec{
+			Replicas: &rbgsReplicas,
+			Template: rbgv1alpha1.RoleBasedGroupSpec{
+				Roles: []rbgv1alpha1.RoleSpec{
+					{
+						Name:          "inference",
+						Replicas:      ptr.To(int32(1)), // One role per group
+						RestartPolicy: rbgv1alpha1.RecreateRoleInstanceOnPodRestart,
+						Workload: rbgv1alpha1.WorkloadSpec{
+							APIVersion: "leaderworkerset.x-k8s.io/v1",
+							Kind:       "LeaderWorkerSet",
+						},
+						LeaderWorkerSet: rbgv1alpha1.LeaderWorkerTemplate{
+							Size: &lwsSize,
+							PatchWorkerTemplate: runtime.RawExtension{
+								Raw: workerPatchJSON,
+							},
+						},
+						RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
+							Type: rbgv1alpha1.RollingUpdateStrategyType,
+							RollingUpdate: &rbgv1alpha1.RollingUpdate{
+								MaxUnavailable: intstr.FromInt(1),
+								MaxSurge:       intstr.FromInt(0),
+							},
+						},
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Annotations: application.Spec.InstanceSpec.Annotations,
+								Labels:      generateLwsLabels(application, arksv1.ArksWorkLoadRoleLeader),
+							},
+							Spec: podSpec,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return rbgs, nil
 }
 
 func generateApplicationServiceName(application *arksv1.ArksApplication) string {
