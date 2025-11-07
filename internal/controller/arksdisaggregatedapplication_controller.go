@@ -38,6 +38,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	lwsapi "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	lwscli "sigs.k8s.io/lws/client-go/clientset/versioned"
@@ -156,10 +157,6 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if application.Status.Phase == string(arksv1.ArksApplicationPhaseFailed) {
-		return ctrl.Result{}, nil
-	}
-
 	if application.Status.Phase == "" {
 		application.Status.Phase = string(arksv1.ArksApplicationPhasePending)
 	}
@@ -242,27 +239,48 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 		}
 	}
 
+	if application.Spec.Prefill.Size < 1 {
+		application.Spec.Prefill.Size = 1
+	}
+	if application.Spec.Decode.Size < 1 {
+		application.Spec.Decode.Size = 1
+	}
+
+	prefillName := fmt.Sprintf("%s-prefill", application.Name)
+	decodeName := fmt.Sprintf("%s-decode", application.Name)
+
+	// Detect backend: LWS if exists, otherwise RBG
+	backend := r.determineBackend(ctx, application.Namespace, prefillName)
+	klog.Infof("application %s/%s: using backend: %s", application.Namespace, application.Name, backend)
+
+	var (
+		prefillRBGS *rbgv1alpha1.RoleBasedGroupSet
+		decodeRBGS  *rbgv1alpha1.RoleBasedGroupSet
+	)
+
+	if backend == arksv1.ArksBackendRBG {
+		var err error
+		prefillRBGS, _, err = r.reconcileDisaggregatedRBGS(ctx, application, model, "prefill", prefillName)
+		if err != nil {
+			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+			r.updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayReconcileFailed", fmt.Sprintf("Failed to reconcile prefill underlay: %q", err))
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile prefill RBGS: %w", err)
+		}
+
+		decodeRBGS, _, err = r.reconcileDisaggregatedRBGS(ctx, application, model, "decode", decodeName)
+		if err != nil {
+			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+			r.updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayReconcileFailed", fmt.Sprintf("Failed to reconcile decode underlay: %q", err))
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile decode RBGS: %w", err)
+		}
+	}
+
 	// start model service
 	if !r.checkApplicationCondition(application, arksv1.ArksApplicationReady) {
 		application.Status.Phase = string(arksv1.ArksApplicationPhaseCreating)
-		if application.Spec.Prefill.Size < 1 {
-			application.Spec.Prefill.Size = 1
-		}
 
-		backend := application.Spec.Backend
-		if backend == "" {
-			backend = arksv1.ArksBackendLWS
-		}
-
-		prefillName := fmt.Sprintf("%s-prefill", application.Name)
-		if backend == arksv1.ArksBackendRBG {
-			if err := r.ensureDisaggregatedRBGS(ctx, application, model, "prefill", prefillName); err != nil {
-				application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-				r.updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "UnderlayGenerateFailed", fmt.Sprintf("Failed to generate prefill underlay: %q", err))
-				return ctrl.Result{}, fmt.Errorf("failed to ensure prefill RBGS: %w", err)
-			}
-			klog.Infof("application %s/%s: ensured prefill underlying RBGS successfully", application.Namespace, application.Name)
-		} else {
+		if backend != arksv1.ArksBackendRBG {
+			// Create prefill LWS
 			if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, prefillName, metav1.GetOptions{}); err != nil {
 				if apierrors.IsNotFound(err) {
 					lws, err := r.generateDisaggregatedLws(application, model, "prefill")
@@ -287,17 +305,8 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 					return ctrl.Result{}, fmt.Errorf("failed to check the prefill underlying LWS: %q", err)
 				}
 			}
-		}
 
-		decodeName := fmt.Sprintf("%s-decode", application.Name)
-		if backend == arksv1.ArksBackendRBG {
-			if err := r.ensureDisaggregatedRBGS(ctx, application, model, "decode", decodeName); err != nil {
-				application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-				r.updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "UnderlayGenerateFailed", fmt.Sprintf("Failed to generate decode underlay: %q", err))
-				return ctrl.Result{}, fmt.Errorf("failed to ensure decode RBGS: %w", err)
-			}
-			klog.Infof("application %s/%s: ensured decode underlying RBGS successfully", application.Namespace, application.Name)
-		} else {
+			// Create decode LWS
 			if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, decodeName, metav1.GetOptions{}); err != nil {
 				if apierrors.IsNotFound(err) {
 					lws, err := r.generateDisaggregatedLws(application, model, "decode")
@@ -377,41 +386,49 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 	}
 
 	// sync underly components
-	prefillName := fmt.Sprintf("%s-prefill", application.Name)
-	backend := application.Spec.Backend
-	if backend == "" {
-		backend = arksv1.ArksBackendLWS
-	}
-
 	if backend == arksv1.ArksBackendRBG {
-		rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
-		if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: prefillName}, rbgs); err != nil {
-			if !apierrors.IsNotFound(err) {
-				klog.Errorf("application %s/%s: failed to query the prefill underlying RBGS status: %q", application.Namespace, application.Name, err)
-				return ctrl.Result{}, fmt.Errorf("failed to query the prefill underlying RBGS status: %q", err)
-			}
-			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-			r.updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlyingNotExist", "The underlying prefill RBGS doesn't exist")
-			klog.Errorf("application %s/%s: the underlying prefill RBGS doesn't exist", application.Namespace, application.Name)
-		} else {
-			application.Status.Prefill.Replicas = rbgs.Status.Replicas
-			application.Status.Prefill.ReadyReplicas = rbgs.Status.ReadyReplicas
-			// RBGS status does not expose UpdatedReplicas; reuse ready replicas as the best available signal.
-			application.Status.Prefill.UpdatedReplicas = rbgs.Status.ReadyReplicas
-
-			prefillReplicas := int32(1)
-			if application.Spec.Prefill.Replicas != nil && *application.Spec.Prefill.Replicas >= 0 {
-				prefillReplicas = *application.Spec.Prefill.Replicas
-			}
-
-			if rbgs.Spec.Replicas == nil || *rbgs.Spec.Replicas != prefillReplicas {
-				rbgs.Spec.Replicas = ptr.To(prefillReplicas)
-				if err := r.Client.Update(ctx, rbgs); err != nil {
-					klog.Errorf("application %s/%s: failed to update prefill rbgs: %q", application.Namespace, application.Name, err)
-				} else {
-					klog.Infof("application %s/%s: update prefill rbgs successfully", application.Namespace, application.Name)
+		if prefillRBGS == nil {
+			current := &rbgv1alpha1.RoleBasedGroupSet{}
+			if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: prefillName}, current); err != nil {
+				if !apierrors.IsNotFound(err) {
+					klog.Errorf("application %s/%s: failed to query the prefill underlying RBGS status: %q", application.Namespace, application.Name, err)
+					return ctrl.Result{}, fmt.Errorf("failed to query the prefill underlying RBGS status: %q", err)
 				}
+				application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+				r.updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlyingNotExist", "The underlying prefill RBGS doesn't exist")
+				klog.Errorf("application %s/%s: the underlying prefill RBGS doesn't exist", application.Namespace, application.Name)
+			} else {
+				prefillRBGS = current
 			}
+		}
+
+		if prefillRBGS != nil {
+			application.Status.Prefill.Replicas = prefillRBGS.Status.Replicas
+			application.Status.Prefill.ReadyReplicas = prefillRBGS.Status.ReadyReplicas
+			// RBGS status does not expose UpdatedReplicas; reuse ready replicas as the best available signal.
+			application.Status.Prefill.UpdatedReplicas = prefillRBGS.Status.ReadyReplicas
+		}
+
+		if decodeRBGS == nil {
+			current := &rbgv1alpha1.RoleBasedGroupSet{}
+			if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: decodeName}, current); err != nil {
+				if !apierrors.IsNotFound(err) {
+					klog.Errorf("application %s/%s: failed to query the decode underlying RBGS status: %q", application.Namespace, application.Name, err)
+					return ctrl.Result{}, fmt.Errorf("failed to query the decode underlying RBGS status: %q", err)
+				}
+				application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+				r.updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlyingNotExist", "The underlying decode RBGS doesn't exist")
+				klog.Errorf("application %s/%s: the underlying decode RBGS doesn't exist", application.Namespace, application.Name)
+			} else {
+				decodeRBGS = current
+			}
+		}
+
+		if decodeRBGS != nil {
+			application.Status.Decode.Replicas = decodeRBGS.Status.Replicas
+			application.Status.Decode.ReadyReplicas = decodeRBGS.Status.ReadyReplicas
+			// RBGS status does not expose UpdatedReplicas; reuse ready replicas as the best available signal.
+			application.Status.Decode.UpdatedReplicas = decodeRBGS.Status.ReadyReplicas
 		}
 	} else {
 		if lws, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, prefillName, metav1.GetOptions{}); err != nil {
@@ -442,40 +459,7 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcile(ctx context.Context, 
 				}
 			}
 		}
-	}
 
-	decodeName := fmt.Sprintf("%s-decode", application.Name)
-	if backend == arksv1.ArksBackendRBG {
-		rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
-		if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: decodeName}, rbgs); err != nil {
-			if !apierrors.IsNotFound(err) {
-				klog.Errorf("application %s/%s: failed to query the decode underlying RBGS status: %q", application.Namespace, application.Name, err)
-				return ctrl.Result{}, fmt.Errorf("failed to query the decode underlying RBGS status: %q", err)
-			}
-			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-			r.updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlyingNotExist", "The underlying decode RBGS doesn't exist")
-			klog.Errorf("application %s/%s: the underlying decode RBGS doesn't exist", application.Namespace, application.Name)
-		} else {
-			application.Status.Decode.Replicas = rbgs.Status.Replicas
-			application.Status.Decode.ReadyReplicas = rbgs.Status.ReadyReplicas
-			// RBGS status does not expose UpdatedReplicas; reuse ready replicas as the best available signal.
-			application.Status.Decode.UpdatedReplicas = rbgs.Status.ReadyReplicas
-
-			decodeReplicas := int32(1)
-			if application.Spec.Decode.Replicas != nil && *application.Spec.Decode.Replicas >= 0 {
-				decodeReplicas = *application.Spec.Decode.Replicas
-			}
-
-			if rbgs.Spec.Replicas == nil || *rbgs.Spec.Replicas != decodeReplicas {
-				rbgs.Spec.Replicas = ptr.To(decodeReplicas)
-				if err := r.Client.Update(ctx, rbgs); err != nil {
-					klog.Errorf("application %s/%s: failed to update decode rbgs: %q", application.Namespace, application.Name, err)
-				} else {
-					klog.Infof("application %s/%s: update decode rbgs successfully", application.Namespace, application.Name)
-				}
-			}
-		}
-	} else {
 		if lws, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, decodeName, metav1.GetOptions{}); err != nil {
 			if !apierrors.IsNotFound(err) {
 				klog.Errorf("application %s/%s: failed to query the decode underlying LWS status: %q", application.Namespace, application.Name, err)
@@ -553,6 +537,7 @@ func (r *ArksDisaggregatedApplicationReconciler) SetupWithManager(mgr ctrl.Manag
 		Named("arksdisaggregatedapplication").
 		Owns(&lwsapi.LeaderWorkerSet{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&rbgv1alpha1.RoleBasedGroupSet{}).
 		Complete(r)
 }
 
@@ -821,28 +806,37 @@ func (r *ArksDisaggregatedApplicationReconciler) deleteDisaggregatedWorkload(ctx
 	return nil
 }
 
-func (r *ArksDisaggregatedApplicationReconciler) ensureDisaggregatedRBGS(ctx context.Context, application *arksv1.ArksDisaggregatedApplication, model *arksv1.ArksModel, disaggregatedRole, name string) error {
-	current := &rbgv1alpha1.RoleBasedGroupSet{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: name}, current); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
+func (r *ArksDisaggregatedApplicationReconciler) reconcileDisaggregatedRBGS(ctx context.Context, application *arksv1.ArksDisaggregatedApplication, model *arksv1.ArksModel, disaggregatedRole, name string) (*rbgv1alpha1.RoleBasedGroupSet, controllerutil.OperationResult, error) {
+	rbgs := &rbgv1alpha1.RoleBasedGroupSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: application.Namespace,
+		},
+	}
 
-		rbgs, err := r.generateDisaggregatedRBGS(application, model, disaggregatedRole)
+	result, err := controllerutil.CreateOrPatch(ctx, r.Client, rbgs, func() error {
+		desired, err := r.generateDisaggregatedRBGS(application, model, disaggregatedRole)
 		if err != nil {
 			return err
 		}
-		rbgs.Name = name
-		ctrl.SetControllerReference(application, rbgs, r.Scheme)
 
-		if err := r.Client.Create(ctx, rbgs); err != nil {
-			if !apierrors.IsAlreadyExists(err) {
-				return err
-			}
-		}
+		rbgs.Labels = desired.Labels
+		rbgs.Spec = desired.Spec
+
+		return controllerutil.SetControllerReference(application, rbgs, r.Scheme)
+	})
+	if err != nil {
+		return nil, controllerutil.OperationResultNone, err
 	}
 
-	return nil
+	switch result {
+	case controllerutil.OperationResultCreated:
+		klog.Infof("application %s/%s: created %s underlying RBGS successfully", application.Namespace, application.Name, disaggregatedRole)
+	case controllerutil.OperationResultUpdated:
+		klog.Infof("application %s/%s: updated %s underlying RBGS successfully (rolling update triggered)", application.Namespace, application.Name, disaggregatedRole)
+	}
+
+	return rbgs, result, nil
 }
 
 func (r *ArksDisaggregatedApplicationReconciler) generateDisaggregatedRBGS(application *arksv1.ArksDisaggregatedApplication, model *arksv1.ArksModel, disaggregatedRole string) (*rbgv1alpha1.RoleBasedGroupSet, error) {
@@ -1008,12 +1002,15 @@ func (r *ArksDisaggregatedApplicationReconciler) generateDisaggregatedRBGS(appli
 	}
 
 	workerPatch := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
-					Name:    "main",
-					Command: workerCommands,
-					Env:     workerEnvs,
+					Name:      "main",
+					Image:     image,
+					Command:   workerCommands,
+					Env:       workerEnvs,
+					Resources: corev1.ResourceRequirements{},
 				},
 			},
 		},
@@ -1028,7 +1025,9 @@ func (r *ArksDisaggregatedApplicationReconciler) generateDisaggregatedRBGS(appli
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: application.Namespace,
 			Labels: map[string]string{
-				arksv1.ArksControllerKeyApplication: application.Name,
+				arksv1.ArksControllerKeyApplication:        application.Name,
+				arksv1.ArksControllerKeyModel:              application.Spec.Model.Name,
+				arksv1.ArksControllerKeyDisaggregationRole: disaggregatedRole,
 			},
 		},
 		Spec: rbgv1alpha1.RoleBasedGroupSetSpec{
@@ -1054,6 +1053,7 @@ func (r *ArksDisaggregatedApplicationReconciler) generateDisaggregatedRBGS(appli
 							RollingUpdate: &rbgv1alpha1.RollingUpdate{
 								MaxUnavailable: intstr.FromInt(1),
 								MaxSurge:       intstr.FromInt(0),
+								Partition:      ptr.To(int32(0)),
 							},
 						},
 						Template: corev1.PodTemplateSpec{
@@ -1550,4 +1550,27 @@ func (r *ArksDisaggregatedApplicationReconciler) checkApplicationVolumes(workloa
 
 func (r *ArksDisaggregatedApplicationReconciler) generateApplicationServiceName(application *arksv1.ArksDisaggregatedApplication) string {
 	return fmt.Sprintf("arks-application-%s", application.Name)
+}
+
+// determineBackend detects backend based on existing resources
+func (r *ArksDisaggregatedApplicationReconciler) determineBackend(
+	ctx context.Context,
+	namespace string,
+	prefillName string,
+) arksv1.ArksBackend {
+	// Check if LWS exists
+	if r.LWSClient != nil {
+		if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(namespace).Get(ctx, prefillName, metav1.GetOptions{}); err == nil {
+			return arksv1.ArksBackendLWS
+		}
+	}
+
+	// Check if RBGS exists
+	rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: prefillName}, rbgs); err == nil {
+		return arksv1.ArksBackendRBG
+	}
+
+	// Default to RBG
+	return arksv1.ArksBackendRBG
 }

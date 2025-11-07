@@ -26,9 +26,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	rbgv1alpha1 "sigs.k8s.io/rbgs/api/workloads/v1alpha1"
 
 	arksv1 "github.com/arks-ai/arks/api/v1"
 )
@@ -176,12 +181,19 @@ var _ = Describe("ArksDisaggregatedapplication Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(rbgs).NotTo(BeNil())
 			Expect(*rbgs.Spec.Replicas).To(Equal(int32(3)))
+			Expect(rbgs.Labels).To(HaveKeyWithValue(arksv1.ArksControllerKeyApplication, "test-app"))
+			Expect(rbgs.Labels).To(HaveKeyWithValue(arksv1.ArksControllerKeyModel, "test-model"))
+			Expect(rbgs.Labels).To(HaveKeyWithValue(arksv1.ArksControllerKeyDisaggregationRole, "prefill"))
 
 			Expect(rbgs.Spec.Template.Roles).To(HaveLen(1))
 			role := rbgs.Spec.Template.Roles[0]
 			Expect(role.Name).To(Equal("prefill"))
 			Expect(role.LeaderWorkerSet.Size).NotTo(BeNil())
 			Expect(*role.LeaderWorkerSet.Size).To(Equal(int32(4)))
+			Expect(role.RolloutStrategy).NotTo(BeNil())
+			Expect(role.RolloutStrategy.RollingUpdate).NotTo(BeNil())
+			Expect(role.RolloutStrategy.RollingUpdate.Partition).NotTo(BeNil())
+			Expect(*role.RolloutStrategy.RollingUpdate.Partition).To(Equal(int32(0)))
 
 			Expect(role.Template.Spec.Containers).To(HaveLen(1))
 			container := role.Template.Spec.Containers[0]
@@ -209,6 +221,137 @@ var _ = Describe("ArksDisaggregatedapplication Controller", func() {
 			Expect(patch.Spec.Containers).To(HaveLen(1))
 			Expect(patch.Spec.Containers[0].Command).To(Equal(override))
 			Expect(patch.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "MODE", Value: "decode"}))
+			Expect(patch.Spec.Containers[0].Resources).To(Equal(corev1.ResourceRequirements{}))
+		})
+	})
+
+	Context("reconcileDisaggregatedRBGS", func() {
+		var (
+			testCtx     context.Context
+			sch         *runtime.Scheme
+			fakeClient  client.Client
+			reconciler  *ArksDisaggregatedApplicationReconciler
+			application *arksv1.ArksDisaggregatedApplication
+			model       *arksv1.ArksModel
+		)
+
+		BeforeEach(func() {
+			testCtx = context.Background()
+			sch = runtime.NewScheme()
+			Expect(arksv1.AddToScheme(sch)).To(Succeed())
+			Expect(rbgv1alpha1.AddToScheme(sch)).To(Succeed())
+
+			fakeClient = fake.NewClientBuilder().WithScheme(sch).Build()
+			reconciler = &ArksDisaggregatedApplicationReconciler{
+				Client: fakeClient,
+				Scheme: sch,
+			}
+
+			prefillReplicas := int32(1)
+			application = &arksv1.ArksDisaggregatedApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pd-app",
+					Namespace: "default",
+					UID:       types.UID("pd-app-uid"),
+				},
+				Spec: arksv1.ArksDisaggregatedApplicationSpec{
+					Backend:      arksv1.ArksBackendRBG,
+					Runtime:      string(arksv1.ArksRuntimeSGLang),
+					RuntimeImage: "sglang:v1",
+					Model:        corev1.LocalObjectReference{Name: "test-model"},
+					Prefill: arksv1.ArksDisaggregatedWorkload{
+						Replicas: &prefillReplicas,
+						Size:     1,
+						InstanceSpec: arksv1.ArksInstanceSpec{
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("4"),
+									corev1.ResourceMemory: resource.MustParse("8Gi"),
+								},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)}},
+								InitialDelaySeconds: 5,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/live", Port: intstr.FromInt(8080)}},
+							},
+						},
+					},
+				},
+			}
+
+			model = &arksv1.ArksModel{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-model",
+					Namespace: "default",
+				},
+				Spec: arksv1.ArksModelSpec{
+					Storage: &arksv1.ArksModelStorage{
+						PVC: &arksv1.ArksModelStoragePVC{
+							Name: "model-pvc",
+							Spec: corev1.PersistentVolumeClaimSpec{},
+						},
+					},
+				},
+			}
+		})
+
+		It("creates and updates RBGS when key fields change", func() {
+			name := "pd-app-prefill"
+
+			rbgs, result, err := reconciler.reconcileDisaggregatedRBGS(testCtx, application, model, "prefill", name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(controllerutil.OperationResultCreated))
+			Expect(rbgs).NotTo(BeNil())
+
+			stored := &rbgv1alpha1.RoleBasedGroupSet{}
+			Expect(fakeClient.Get(testCtx, types.NamespacedName{Name: name, Namespace: "default"}, stored)).To(Succeed())
+			Expect(stored.Spec.Template.Roles).To(HaveLen(1))
+
+			role := stored.Spec.Template.Roles[0]
+			leader := role.Template.Spec.Containers[0]
+			Expect(leader.Image).To(Equal("sglang:v1"))
+			Expect(leader.ReadinessProbe.HTTPGet.Path).To(Equal("/healthz"))
+			Expect(leader.LivenessProbe.HTTPGet.Path).To(Equal("/live"))
+			Expect(leader.Resources.Limits[corev1.ResourceCPU]).To(Equal(resource.MustParse("4")))
+			Expect(role.Template.Spec.Volumes).To(HaveLen(1))
+			Expect(role.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("model-pvc"))
+
+			// Mutate spec fields
+			application.Spec.RuntimeImage = "sglang:v2"
+			application.Spec.Prefill.InstanceSpec.Resources.Limits[corev1.ResourceCPU] = resource.MustParse("6")
+			application.Spec.Prefill.InstanceSpec.ReadinessProbe = &corev1.Probe{
+				ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromInt(8080)}},
+				InitialDelaySeconds: 3,
+			}
+			application.Spec.Prefill.InstanceSpec.LivenessProbe = &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/livez", Port: intstr.FromInt(8080)}},
+			}
+			application.Spec.Prefill.InstanceSpec.Env = []corev1.EnvVar{{Name: "NEW_ENV", Value: "1"}}
+			application.Spec.Prefill.LeaderCommandOverride = []string{"/bin/bash", "-c", "custom leader"}
+			application.Spec.Prefill.WorkerCommandOverride = []string{"/bin/bash", "-c", "custom worker"}
+			model.Spec.Storage.PVC.Name = "model-pvc-v2"
+
+			rbgs, result, err = reconciler.reconcileDisaggregatedRBGS(testCtx, application, model, "prefill", name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(controllerutil.OperationResultUpdated))
+
+			Expect(fakeClient.Get(testCtx, types.NamespacedName{Name: name, Namespace: "default"}, stored)).To(Succeed())
+			role = stored.Spec.Template.Roles[0]
+			leader = role.Template.Spec.Containers[0]
+			Expect(leader.Image).To(Equal("sglang:v2"))
+			Expect(leader.Command).To(Equal([]string{"/bin/bash", "-c", "custom leader"}))
+			Expect(leader.ReadinessProbe.HTTPGet.Path).To(Equal("/readyz"))
+			Expect(leader.LivenessProbe.HTTPGet.Path).To(Equal("/livez"))
+			Expect(leader.Env).To(ContainElement(corev1.EnvVar{Name: "NEW_ENV", Value: "1"}))
+			Expect(leader.Resources.Limits[corev1.ResourceCPU]).To(Equal(resource.MustParse("6")))
+			Expect(role.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("model-pvc-v2"))
+
+			patch := &corev1.PodTemplateSpec{}
+			Expect(json.Unmarshal(role.LeaderWorkerSet.PatchWorkerTemplate.Raw, patch)).To(Succeed())
+			Expect(patch.Spec.Containers).To(HaveLen(1))
+			Expect(patch.Spec.Containers[0].Command).To(Equal([]string{"/bin/bash", "-c", "custom worker"}))
 		})
 	})
 })
