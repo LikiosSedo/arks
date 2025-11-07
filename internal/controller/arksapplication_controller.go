@@ -254,11 +254,9 @@ func (r *ArksApplicationReconciler) reconcile(ctx context.Context, application *
 		}
 	}
 
-	// Determine backend to use
-	backend := application.Spec.Backend
-	if backend == "" {
-		backend = arksv1.ArksBackendLWS // Default to LWS for backward compatibility
-	}
+	// Detect backend: LWS if exists, otherwise RBG
+	backend := r.determineBackend(ctx, application.Namespace, application.Name)
+	klog.Infof("application %s/%s: using backend: %s", application.Namespace, application.Name, backend)
 
 	// Always reconcile RBGS (regardless of Ready status) to support rolling updates
 	if backend == arksv1.ArksBackendRBG {
@@ -978,4 +976,27 @@ func initializeApplicationCondition(application *arksv1.ArksApplication) {
 		Message:            "Wait the controller to check the application status",
 		LastTransitionTime: metav1.Now(),
 	})
+}
+
+// determineBackend detects backend based on existing resources
+func (r *ArksApplicationReconciler) determineBackend(
+	ctx context.Context,
+	namespace string,
+	name string,
+) arksv1.ArksBackend {
+	// Check if LWS exists
+	if r.LWSClient != nil {
+		if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+			return arksv1.ArksBackendLWS
+		}
+	}
+
+	// Check if RBGS exists
+	rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, rbgs); err == nil {
+		return arksv1.ArksBackendRBG
+	}
+
+	// Default to RBG
+	return arksv1.ArksBackendRBG
 }

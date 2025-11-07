@@ -69,17 +69,6 @@ spec:
           spec:
             description: ArksApplicationSpec defines the desired state of ArksApplication.
             properties:
-              backend:
-                default: lws
-                description: |-
-                  Backend defines the workload orchestration backend.
-                  Currently supports: lws (LeaderWorkerSet), rbg (RoleBasedGroup).
-                  Default is lws for backward compatibility.
-                  RBG backend supports rolling updates while LWS does not.
-                enum:
-                - lws
-                - rbg
-                type: string
               instanceSpec:
                 description: |-
                   EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!

@@ -279,15 +279,6 @@ type ArksApplicationSpec struct {
 	// +optional
 	RuntimeImagePullSecrets []corev1.LocalObjectReference `json:"runtimeImagePullSecrets"`
 
-	// Backend defines the workload orchestration backend.
-	// Currently supports: lws (LeaderWorkerSet), rbg (RoleBasedGroup).
-	// Default is lws for backward compatibility.
-	// RBG backend supports rolling updates while LWS does not.
-	// +optional
-	// +kubebuilder:validation:Enum=lws;rbg
-	// +kubebuilder:default=lws
-	Backend ArksBackend `json:"backend,omitempty"`
-
 	Model corev1.LocalObjectReference `json:"model"`
 
 	// ServedModelName defines a custom model name.
