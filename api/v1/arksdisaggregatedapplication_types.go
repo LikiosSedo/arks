@@ -66,6 +66,67 @@ type VolcanoSchedulingPodGroupPolicySource struct {
 	Queue string `json:"queue,omitempty"`
 }
 
+// CoordinationPolicy controls the coordination strategy for prefill and decode roles.
+// When configured, prefill and decode deployment/update will proceed in a coordinated manner.
+// This is independent of PodGroupPolicy and can be used with LWS-level gang scheduling.
+type CoordinationPolicy struct {
+	// Scaling defines the coordination strategy for initial deployment and scale-up.
+	// Takes effect when prefill/decode scales from 0 replicas, or when replicas increase.
+	// +optional
+	Scaling *ScalingCoordination `json:"scaling,omitempty"`
+
+	// RollingUpdate defines the coordination strategy for rolling updates.
+	// Takes effect when Pod template changes (e.g., image, config) trigger a rolling update.
+	// +optional
+	RollingUpdate *RollingUpdateCoordination `json:"rollingUpdate,omitempty"`
+}
+
+// ScalingCoordination defines the coordination strategy for scaling operations.
+// Ensures prefill and decode are created proportionally to avoid resource waste.
+type ScalingCoordination struct {
+	// MaxSkew defines the maximum allowed difference in deployment progress between prefill and decode.
+	// For example, with "10%", the deployment progress difference cannot exceed 10%.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:default="10%"
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	MaxSkew string `json:"maxSkew,omitempty"`
+
+	// Progression defines when to proceed to the next batch of deployment.
+	// - OrderScheduled: Wait for all pods in current batch to be scheduled (have nodeName).
+	// - OrderReady: Wait for all pods in current batch to be ready.
+	// +optional
+	// +kubebuilder:default="OrderScheduled"
+	// +kubebuilder:validation:Enum=OrderScheduled;OrderReady
+	Progression string `json:"progression,omitempty"`
+}
+
+// RollingUpdateCoordination defines the coordination strategy for rolling updates.
+// Ensures prefill and decode are updated synchronously to avoid version inconsistency.
+type RollingUpdateCoordination struct {
+	// MaxSkew defines the maximum allowed difference in update progress between prefill and decode.
+	// For example, with "5%", the update progress difference cannot exceed 5%.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:default="5%"
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	MaxSkew string `json:"maxSkew,omitempty"`
+
+	// MaxUnavailable defines the maximum number of unavailable replicas during the update (percentage).
+	// If configured, overrides the MaxUnavailable in each role's RolloutStrategy.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	MaxUnavailable string `json:"maxUnavailable,omitempty"`
+
+	// Partition defines the partition point for rolling update (percentage).
+	// If configured, overrides the Partition in each role's RolloutStrategy.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	Partition string `json:"partition,omitempty"`
+}
+
 type ArksDisaggregatedRouter struct {
 	// +optional
 	Replicas *int32 `json:"replicas"`
@@ -142,9 +203,19 @@ type ArksDisaggregatedApplicationSpec struct {
 	// Decode
 	Decode ArksDisaggregatedWorkload `json:"decode"`
 
+	// PodGroupPolicy controls RBG-level gang scheduling.
+	// When using LWS workloads with LWS-level gang scheduling enabled,
+	// leave this unset and use CoordinationPolicy instead.
 	// +optional
 	// +kubebuilder:validation:Immutable
-	PodGroupPolicy *PodGroupPolicy `json:"podGroupPolicy"`
+	PodGroupPolicy *PodGroupPolicy `json:"podGroupPolicy,omitempty"`
+
+	// CoordinationPolicy controls the coordinated scaling strategy for prefill and decode.
+	// This enables progressive deployment where prefill and decode are created in batches
+	// according to the specified ratio, independent of PodGroupPolicy.
+	// Use this with LWS-level gang scheduling for optimal deployment behavior.
+	// +optional
+	CoordinationPolicy *CoordinationPolicy `json:"coordinationPolicy,omitempty"`
 }
 
 type ArksComponentStatus struct {

@@ -858,21 +858,21 @@ func generateRBGS(application *arksv1.ArksApplication, model *arksv1.ArksModel) 
 							APIVersion: "leaderworkerset.x-k8s.io/v1",
 							Kind:       "LeaderWorkerSet",
 						},
-						LeaderWorkerSet: rbgv1alpha1.LeaderWorkerTemplate{
+						LeaderWorkerSet: &rbgv1alpha1.LeaderWorkerTemplate{
 							Size: &lwsSize,
-							PatchWorkerTemplate: runtime.RawExtension{
+							PatchWorkerTemplate: &runtime.RawExtension{
 								Raw: workerPatchJSON,
 							},
 						},
 						RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
 							Type: rbgv1alpha1.RollingUpdateStrategyType,
 							RollingUpdate: &rbgv1alpha1.RollingUpdate{
-								MaxUnavailable: intstr.FromInt(1),
-								MaxSurge:       intstr.FromInt(0),
-								Partition:      ptr.To(int32(0)), // Include partition to match API server default
+								MaxUnavailable: ptr.To(intstr.FromInt(1)),
+								MaxSurge:       ptr.To(intstr.FromInt(0)),
+								Partition:      ptr.To(intstr.FromInt(0)), // Include partition to match API server default
 							},
 						},
-						Template: corev1.PodTemplateSpec{
+						Template: &corev1.PodTemplateSpec{
 							ObjectMeta: metav1.ObjectMeta{
 								Annotations: application.Spec.InstanceSpec.Annotations,
 								Labels:      generateLwsLabels(application, arksv1.ArksWorkLoadRoleLeader),

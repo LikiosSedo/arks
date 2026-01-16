@@ -921,11 +921,11 @@ func (r *ArksDisaggregatedApplicationReconciler) buildSchedulerRole(ctx context.
 		RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
 			Type: rbgv1alpha1.RollingUpdateStrategyType,
 			RollingUpdate: &rbgv1alpha1.RollingUpdate{
-				MaxUnavailable: intstr.FromInt(1),
-				MaxSurge:       intstr.FromInt(0),
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				MaxSurge:       ptr.To(intstr.FromInt(0)),
 			},
 		},
-		Template: corev1.PodTemplateSpec{
+		Template: &corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Annotations: application.Spec.Router.InstanceSpec.Annotations,
 				Labels:      r.generateRouterLabels(application),
@@ -1103,21 +1103,21 @@ func (r *ArksDisaggregatedApplicationReconciler) buildWorkloadRole(application *
 			APIVersion: "leaderworkerset.x-k8s.io/v1",
 			Kind:       "LeaderWorkerSet",
 		},
-		LeaderWorkerSet: rbgv1alpha1.LeaderWorkerTemplate{
+		LeaderWorkerSet: &rbgv1alpha1.LeaderWorkerTemplate{
 			Size: ptr.To(int32(size)),
-			PatchLeaderTemplate: runtime.RawExtension{
+			PatchLeaderTemplate: &runtime.RawExtension{
 				Raw: leaderPatchJSON,
 			},
 		},
 		RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
 			Type: rbgv1alpha1.RollingUpdateStrategyType,
 			RollingUpdate: &rbgv1alpha1.RollingUpdate{
-				MaxUnavailable: intstr.FromInt(1),
-				MaxSurge:       intstr.FromInt(0),
-				Partition:      ptr.To(int32(0)),
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				MaxSurge:       ptr.To(intstr.FromInt(0)),
+				Partition:      ptr.To(intstr.FromInt(0)),
 			},
 		},
-		Template: corev1.PodTemplateSpec{
+		Template: &corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
 				Annotations: workload.InstanceSpec.Annotations,
 				Labels:      generateLabels(application, arksv1.ArksWorkLoadRoleWorker),
@@ -1313,6 +1313,9 @@ func (r *ArksDisaggregatedApplicationReconciler) generateUnifiedRBGS(ctx context
 			Replicas: ptr.To(rbgsReplicas),
 			Template: rbgv1alpha1.RoleBasedGroupSpec{
 				PodGroupPolicy: convertToRbgPodGroupPolicy(application.Spec.PodGroupPolicy),
+				// Coordination scaling is now independent of PodGroupPolicy,
+				// allowing it to work with LWS-level gang scheduling
+				CoordinationRequirements: buildCoordinationRequirements(application.Spec.CoordinationPolicy),
 				Roles: []rbgv1alpha1.RoleSpec{
 					schedulerRole,
 					prefillRole,

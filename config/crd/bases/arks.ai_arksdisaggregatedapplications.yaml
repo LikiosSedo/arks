@@ -68,6 +68,66 @@ spec:
             description: ArksDisaggregatedApplicationSpec defines the desired state
               of ArksDisaggregatedApplication.
             properties:
+              coordinationPolicy:
+                description: |-
+                  CoordinationPolicy controls the coordinated scaling strategy for prefill and decode.
+                  This enables progressive deployment where prefill and decode are created in batches
+                  according to the specified ratio, independent of PodGroupPolicy.
+                  Use this with LWS-level gang scheduling for optimal deployment behavior.
+                properties:
+                  rollingUpdate:
+                    description: |-
+                      RollingUpdate defines the coordination strategy for rolling updates.
+                      Takes effect when Pod template changes (e.g., image, config) trigger a rolling update.
+                    properties:
+                      maxSkew:
+                        default: 5%
+                        description: |-
+                          MaxSkew defines the maximum allowed difference in update progress between prefill and decode.
+                          For example, with "5%", the update progress difference cannot exceed 5%.
+                          Only percentage values are supported.
+                        pattern: ^([0-9]|[1-9][0-9]|100)%$
+                        type: string
+                      maxUnavailable:
+                        description: |-
+                          MaxUnavailable defines the maximum number of unavailable replicas during the update (percentage).
+                          If configured, overrides the MaxUnavailable in each role's RolloutStrategy.
+                          Only percentage values are supported.
+                        pattern: ^([0-9]|[1-9][0-9]|100)%$
+                        type: string
+                      partition:
+                        description: |-
+                          Partition defines the partition point for rolling update (percentage).
+                          If configured, overrides the Partition in each role's RolloutStrategy.
+                          Only percentage values are supported.
+                        pattern: ^([0-9]|[1-9][0-9]|100)%$
+                        type: string
+                    type: object
+                  scaling:
+                    description: |-
+                      Scaling defines the coordination strategy for initial deployment and scale-up.
+                      Takes effect when prefill/decode scales from 0 replicas, or when replicas increase.
+                    properties:
+                      maxSkew:
+                        default: 10%
+                        description: |-
+                          MaxSkew defines the maximum allowed difference in deployment progress between prefill and decode.
+                          For example, with "10%", the deployment progress difference cannot exceed 10%.
+                          Only percentage values are supported.
+                        pattern: ^([0-9]|[1-9][0-9]|100)%$
+                        type: string
+                      progression:
+                        default: OrderScheduled
+                        description: |-
+                          Progression defines when to proceed to the next batch of deployment.
+                          - OrderScheduled: Wait for all pods in current batch to be scheduled (have nodeName).
+                          - OrderReady: Wait for all pods in current batch to be ready.
+                        enum:
+                        - OrderScheduled
+                        - OrderReady
+                        type: string
+                    type: object
+                type: object
               decode:
                 description: Decode
                 properties:
@@ -6322,8 +6382,10 @@ spec:
                 type: object
                 x-kubernetes-map-type: atomic
               podGroupPolicy:
-                description: PodGroupPolicy represents a PodGroup configuration for
-                  gang-scheduling.
+                description: |-
+                  PodGroupPolicy controls RBG-level gang scheduling.
+                  When using LWS workloads with LWS-level gang scheduling enabled,
+                  leave this unset and use CoordinationPolicy instead.
                 properties:
                   kubeScheduling:
                     description: KubeScheduling plugin from the Kubernetes scheduler-plugins
