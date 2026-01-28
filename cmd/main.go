@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -221,8 +222,17 @@ func main() {
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		klog.Errorf("unable to get in cluster config: %q", err)
-		os.Exit(1)
+		klog.Infof("unable to get in cluster config, trying kubeconfig: %q", err)
+		// Fallback to kubeconfig for local development
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			kubeconfig = os.Getenv("HOME") + "/.kube/config"
+		}
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			klog.Errorf("unable to build config from kubeconfig: %q", err)
+			os.Exit(1)
+		}
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(config)

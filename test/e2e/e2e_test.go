@@ -49,8 +49,22 @@ var _ = Describe("Manager", Ordered, func() {
 	// enforce the restricted security policy to the namespace, installing CRDs,
 	// and deploying the controller.
 	BeforeAll(func() {
+		// Skip Manager tests when using existing cluster - operator is already deployed
+		// and this test would conflict with the existing deployment
+		if useExistingCluster {
+			Skip("Skipping Manager tests when USE_EXISTING_CLUSTER=true (operator already deployed)")
+		}
+
+		By("cleaning up any residual resources from previous runs")
+		// Delete namespace if it exists (ignore errors if it doesn't exist)
+		cmd := exec.Command("kubectl", "delete", "ns", namespace, "--ignore-not-found", "--wait=false")
+		_, _ = utils.Run(cmd)
+		// Wait for namespace to be fully deleted (if it was in terminating state)
+		cmd = exec.Command("kubectl", "wait", "--for=delete", fmt.Sprintf("ns/%s", namespace), "--timeout=60s")
+		_, _ = utils.Run(cmd)
+
 		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		cmd = exec.Command("kubectl", "create", "ns", namespace)
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
@@ -74,6 +88,11 @@ var _ = Describe("Manager", Ordered, func() {
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
 	AfterAll(func() {
+		// Skip cleanup when using existing cluster - don't destroy the shared environment
+		if useExistingCluster {
+			return
+		}
+
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)

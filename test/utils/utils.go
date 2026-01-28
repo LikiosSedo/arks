@@ -19,12 +19,20 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:golint,revive
+	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	arksv1 "github.com/arks-ai/arks/api/v1"
 )
 
 const (
@@ -248,4 +256,43 @@ func UncommentCode(filename, target, prefix string) error {
 	// false positive
 	// nolint:gosec
 	return os.WriteFile(filename, out.Bytes(), 0644)
+}
+
+// UpdateArksDisaggApp updates an ArksDisaggregatedApplication with retry on conflict
+func UpdateArksDisaggApp(ctx context.Context, c client.Client, app *arksv1.ArksDisaggregatedApplication, mutate func(*arksv1.ArksDisaggregatedApplication)) {
+	gomega.Eventually(func() error {
+		return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Get the latest version
+			latest := &arksv1.ArksDisaggregatedApplication{}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(app), latest); err != nil {
+				return err
+			}
+			// Apply mutations
+			mutate(latest)
+			// Update
+			return c.Update(ctx, latest)
+		})
+	}, "30s", "1s").Should(gomega.Succeed(), "Failed to update ArksDisaggregatedApplication")
+}
+
+// DeleteRolePod deletes a pod with the specified role label
+func DeleteRolePod(ctx context.Context, c client.Client, namespace, appName, role string) error {
+	podList := &corev1.PodList{}
+	if err := c.List(ctx, podList,
+		client.InNamespace(namespace),
+		client.MatchingLabels{
+			"arks.ai/application":         appName,
+			"arks.ai/disaggregation-role": role,
+		}); err != nil {
+		return err
+	}
+	if len(podList.Items) == 0 {
+		return fmt.Errorf("no pods found for role %s", role)
+	}
+	return c.Delete(ctx, &podList.Items[0])
+}
+
+// IntOrString returns an intstr.IntOrString from int
+func IntOrString(val int) intstr.IntOrString {
+	return intstr.FromInt(val)
 }
