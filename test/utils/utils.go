@@ -19,13 +19,53 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:golint,revive
+	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	arksv1 "github.com/arks-ai/arks/api/v1"
 )
+
+// UpdateArksDisaggApp updates an ArksDisaggregatedApplication with retry
+func UpdateArksDisaggApp(ctx context.Context, c client.Client, app *arksv1.ArksDisaggregatedApplication, mutate func(*arksv1.ArksDisaggregatedApplication)) {
+	gomega.Eventually(func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(app), app); err != nil {
+			return err
+		}
+		mutate(app)
+		return c.Update(ctx, app)
+	}, "30s", "1s").Should(gomega.Succeed())
+}
+
+// DeleteRolePod deletes a pod by role label
+func DeleteRolePod(ctx context.Context, c client.Client, namespace, appName, role string) error {
+	podList := &corev1.PodList{}
+	if err := c.List(ctx, podList, client.InNamespace(namespace),
+		client.MatchingLabels{
+			"arks.ai/application":         appName,
+			"arks.ai/disaggregation-role": role,
+		}); err != nil {
+		return err
+	}
+
+	if len(podList.Items) > 0 {
+		return c.Delete(ctx, &podList.Items[0])
+	}
+	return nil
+}
+
+// IntOrString creates an intstr.IntOrString from an int
+func IntOrString(val int) intstr.IntOrString {
+	return intstr.FromInt32(int32(val))
+}
 
 const (
 	prometheusOperatorVersion = "v0.77.1"

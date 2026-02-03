@@ -28,7 +28,7 @@ require (
 	sigs.k8s.io/rbgs v0.0.0-00010101000000-000000000000
 )
 
-replace sigs.k8s.io/rbgs => github.com/sgl-project/rbg v0.5.0-alpha.4
+replace sigs.k8s.io/rbgs => gitlab.scitix-inner.ai/k8s/rbg v0.0.0-20260130024731-c7d903d5779e
 
 require (
 	cel.dev/expr v0.24.0 // indirect

@@ -221,8 +221,12 @@ func main() {
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		klog.Errorf("unable to get in cluster config: %q", err)
-		os.Exit(1)
+		klog.Infof("unable to get in cluster config, trying kubeconfig: %q", err)
+		config, err = ctrl.GetConfig()
+		if err != nil {
+			klog.Errorf("unable to get kubeconfig: %q", err)
+			os.Exit(1)
+		}
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(config)
