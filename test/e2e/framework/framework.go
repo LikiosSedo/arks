@@ -277,6 +277,25 @@ func (f *Framework) AfterEach() {
 		logger.Info("Skipping ArksModel cleanup (SkipModelCleanup=true)")
 	}
 
+	// Clean up transient config objects created by test cases.
+	err = f.Client.DeleteAllOf(
+		f.Ctx,
+		&corev1.ConfigMap{},
+		client.InNamespace(f.Namespace),
+	)
+	if err != nil {
+		logger.Error(err, "Failed to delete ConfigMaps")
+	}
+
+	err = f.Client.DeleteAllOf(
+		f.Ctx,
+		&corev1.Secret{},
+		client.InNamespace(f.Namespace),
+	)
+	if err != nil {
+		logger.Error(err, "Failed to delete Secrets")
+	}
+
 	// Wait for cleanup to complete
 	gomega.Eventually(func() int {
 		list := &arksv1.ArksDisaggregatedApplicationList{}
@@ -304,6 +323,9 @@ func (f *Framework) AfterEach() {
 		}
 		return len(list.Items)
 	}, Timeout, Interval).Should(gomega.Equal(0), "All ArksApplications should be deleted")
+
+	// Reset flag to avoid leaking SkipModelCleanup across specs.
+	f.SkipModelCleanup = false
 }
 
 // GetScheme returns the scheme used by the framework
