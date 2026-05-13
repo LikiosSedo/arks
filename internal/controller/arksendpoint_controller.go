@@ -49,22 +49,22 @@ const (
 )
 
 func (r *ArksEndpointReconciler) ArksAppIndexFunc(obj client.Object) []string {
-      if app, ok := obj.(*arksv1.ArksApplication); ok {
-          if app.Spec.ServedModelName == "" {
-              return []string{app.Spec.Model.Name}
-          }
-          return []string{app.Spec.ServedModelName}
-      }
+	if app, ok := obj.(*arksv1.ArksApplication); ok {
+		if app.Spec.ServedModelName == "" {
+			return []string{app.Spec.Model.Name}
+		}
+		return []string{app.Spec.ServedModelName}
+	}
 
-      if app, ok := obj.(*arksv1.ArksDisaggregatedApplication); ok {
-          if app.Spec.ServedModelName == "" {
-              return []string{app.Spec.Model.Name}
-          }
-          return []string{app.Spec.ServedModelName}
-      }
+	if app, ok := obj.(*arksv1.ArksDisaggregatedApplication); ok {
+		if app.Spec.ServedModelName == "" {
+			return []string{app.Spec.Model.Name}
+		}
+		return []string{app.Spec.ServedModelName}
+	}
 
-      return nil
-  }
+	return nil
+}
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ArksEndpointReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -297,7 +297,7 @@ func (r *ArksEndpointReconciler) reconcile(ctx context.Context, ep *arksv1.ArksE
 			klog.V(4).InfoS("application service exist in static route", "service", svcName)
 			continue
 		}
-		if app.Spec.Replicas != int(app.Status.ReadyReplicas) {
+		if !isArksApplicationReady(&app) {
 			klog.V(4).InfoS("application status not ready", "service", svcName)
 			continue
 		}
@@ -416,27 +416,27 @@ func (r *ArksEndpointReconciler) reconcile(ctx context.Context, ep *arksv1.ArksE
 	return ctrl.Result{}, nil
 }
 
-  func getArksEndpointNameFromApplication(obj client.Object) string {
-        if obj == nil {
-                return ""
-        }
+func getArksEndpointNameFromApplication(obj client.Object) string {
+	if obj == nil {
+		return ""
+	}
 
-        if app, ok := obj.(*arksv1.ArksApplication); ok {
-                if app.Spec.ServedModelName == "" {
-                        return app.Spec.Model.Name
-                }
-                return app.Spec.ServedModelName
-        }
+	if app, ok := obj.(*arksv1.ArksApplication); ok {
+		if app.Spec.ServedModelName == "" {
+			return app.Spec.Model.Name
+		}
+		return app.Spec.ServedModelName
+	}
 
-        if app, ok := obj.(*arksv1.ArksDisaggregatedApplication); ok {
-                if app.Spec.ServedModelName == "" {
-                        return app.Spec.Model.Name
-                }
-                return app.Spec.ServedModelName
-        }
+	if app, ok := obj.(*arksv1.ArksDisaggregatedApplication); ok {
+		if app.Spec.ServedModelName == "" {
+			return app.Spec.Model.Name
+		}
+		return app.Spec.ServedModelName
+	}
 
-        return ""
-  }
+	return ""
+}
 
 func isArksApplicationReady(obj client.Object) bool {
 	if obj == nil {
@@ -448,7 +448,7 @@ func isArksApplicationReady(obj client.Object) bool {
 		if !ok {
 			return false
 		}
-		return app.Spec.Replicas == int(app.Status.ReadyReplicas)
+		return isArksAppReady(app)
 	case *arksv1.ArksDisaggregatedApplication:
 		app, ok := obj.(*arksv1.ArksDisaggregatedApplication)
 		if !ok {

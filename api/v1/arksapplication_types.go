@@ -25,8 +25,8 @@ type ArksDriver string
 type ArksRuntime string
 type ArksApplicationPhase string
 type ArksApplicationConditionType string
-
-type ArksBackend string
+type ArksApplicationMode string
+type ArksApplicationTrafficTarget string
 
 const (
 	ArksApplicationPhasePending  ArksApplicationPhase = "Pending"
@@ -42,29 +42,123 @@ const (
 	ArksApplicationLoaded ArksApplicationConditionType = "Loaded"
 	// ArksApplicationReady is the condition that indicates if the application is ready or not.
 	ArksApplicationReady ArksApplicationConditionType = "Ready"
+	// ArksApplicationTrafficTargetReady is the condition that indicates service traffic is routed to a ready target.
+	ArksApplicationTrafficTargetReady ArksApplicationConditionType = "TrafficTargetReady"
 
 	ArksRuntimeDefault ArksRuntime = "vllm" // The default driver is vLLM
 	ArksRuntimeVLLM    ArksRuntime = "vllm"
 	ArksRuntimeSGLang  ArksRuntime = "sglang"
 	ArksRuntimeDynamo  ArksRuntime = "dynamo"
 
-	// Backend types for workload orchestration
-	ArksBackendLWS ArksBackend = "lws" // LeaderWorkerSet backend (no rolling update)
-	ArksBackendRBG ArksBackend = "rbg" // RoleBasedGroup backend (supports rolling update)
+	ArksApplicationModeUnified       ArksApplicationMode = "unified"
+	ArksApplicationModeDisaggregated ArksApplicationMode = "disaggregated"
+
+	// ArksApplicationTrafficTargetEngine indicates the Service routes traffic
+	// directly to the inference engine pod (i.e., the unified role).
+	ArksApplicationTrafficTargetEngine  ArksApplicationTrafficTarget = "engine"
+	ArksApplicationTrafficTargetRouter  ArksApplicationTrafficTarget = "router"
+	ArksApplicationTrafficTargetPending ArksApplicationTrafficTarget = "pending"
 )
 
 const (
-	ArksControllerKeyApplication        = "arks.ai/application"
-	ArksControllerKeyModel              = "arks.ai/model"
-	ArksControllerKeyToken              = "arks.ai/token"
-	ArksControllerKeyQuota              = "arks.ai/quota"
-	ArksControllerKeyWorkLoadRole       = "arks.ai/work-load-role"
-	ArksControllerKeyDisaggregationRole = "arks.ai/disaggregation-role"
-	ArksControllerKeySglangRouter       = "arks.ai/sglang-router"
+	ArksControllerKeyApplication = "arks.ai/application"
+	ArksControllerKeyModel       = "arks.ai/model"
+	ArksControllerKeyToken       = "arks.ai/token"
+	ArksControllerKeyQuota       = "arks.ai/quota"
+	// ArksControllerKeyWorkLoadRole identifies leader/worker within a role's pods.
+	ArksControllerKeyWorkLoadRole = "arks.ai/work-load-role"
+	// ArksControllerKeyRole identifies the ArksApplication role
+	// (unified / router / prefill / decode) for Service selector and discovery.
+	// New ArksApplication CRD uses this key.
+	ArksControllerKeyRole         = "arks.ai/role"
+	ArksControllerKeySglangRouter = "arks.ai/sglang-router"
 
 	ArksWorkLoadRoleLeader = "leader"
 	ArksWorkLoadRoleWorker = "worker"
 )
+
+// ============================================================================
+// LEGACY: symbols below this block exist only to support the frozen
+// ArksDisaggregatedApplication CRD (a transitional CRD kept for backward
+// compatibility). They are NOT referenced by ArksApplication code paths.
+//
+// When ArksDisaggregatedApplication is removed in a future release, every
+// symbol in this block can be deleted along with the legacy CRD's types,
+// controller, and scheme registration.
+//
+// Do NOT add new references to these from new ArksApplication code paths.
+// ============================================================================
+
+// ArksBackend selects the workload backend type used by the legacy
+// ArksDisaggregatedApplication controller.
+//
+// Deprecated: legacy ArksDisaggregatedApplication only.
+type ArksBackend string
+
+const (
+	// ArksBackendLWS / ArksBackendRBG are used by the legacy
+	// ArksDisaggregatedApplication controller to dispatch workload generation.
+	//
+	// Deprecated: legacy ArksDisaggregatedApplication only.
+	ArksBackendLWS ArksBackend = "lws"
+	ArksBackendRBG ArksBackend = "rbg"
+
+	// ArksControllerKeyDisaggregationRole is the Pod label key used by the
+	// legacy ArksDisaggregatedApplication controller (router / prefill / decode).
+	// New ArksApplication uses ArksControllerKeyRole ("arks.ai/role") instead.
+	//
+	// Deprecated: legacy ArksDisaggregatedApplication only.
+	ArksControllerKeyDisaggregationRole = "arks.ai/disaggregation-role"
+)
+
+// ArksRoleStatus reports the status of a single ArksApplication role
+// (unified / router / prefill / decode).
+type ArksRoleStatus struct {
+	Replicas        int32 `json:"replicas"`
+	ReadyReplicas   int32 `json:"readyReplicas"`
+	UpdatedReplicas int32 `json:"updatedReplicas"`
+}
+
+// ArksPodGroupPolicy is the ArksApplication-owned PodGroup configuration for
+// gang-scheduling. It mirrors the structure of the legacy PodGroupPolicy used
+// by ArksDisaggregatedApplication but is defined independently so the new CRD
+// does not depend on the legacy CRD's types.
+type ArksPodGroupPolicy struct {
+	ArksPodGroupPolicySource `json:",inline"`
+}
+
+// ArksPodGroupPolicySource enumerates supported gang-scheduling plugins.
+// Only one of its members may be specified.
+type ArksPodGroupPolicySource struct {
+	// KubeScheduling plugin from the Kubernetes scheduler-plugins for gang-scheduling.
+	KubeScheduling *ArksKubeSchedulingPodGroupPolicySource `json:"kubeScheduling,omitempty"`
+
+	// VolcanoScheduling plugin for Volcano gang-scheduling.
+	VolcanoScheduling *ArksVolcanoSchedulingPodGroupPolicySource `json:"volcanoScheduling,omitempty"`
+}
+
+// ArksKubeSchedulingPodGroupPolicySource configures the kube-scheduler-plugins backend.
+// The number of min members in the PodGroupSpec is always equal to the number of rbg pods.
+type ArksKubeSchedulingPodGroupPolicySource struct {
+	// Time threshold to schedule PodGroup for gang-scheduling.
+	// Defaults to 60 seconds.
+	// +kubebuilder:default=60
+	ScheduleTimeoutSeconds *int32 `json:"scheduleTimeoutSeconds,omitempty"`
+}
+
+// ArksVolcanoSchedulingPodGroupPolicySource configures the Volcano backend.
+type ArksVolcanoSchedulingPodGroupPolicySource struct {
+	// If specified, indicates the PodGroup's priority. "system-node-critical" and
+	// "system-cluster-critical" are two special keywords which indicate the
+	// highest priorities with the former being the highest priority.
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+
+	// Queue defines the queue to allocate resource for PodGroup; if queue does not exist,
+	// the PodGroup will not be scheduled. Defaults to `default` Queue with the lowest weight.
+	// +optional
+	Queue string `json:"queue,omitempty"`
+}
 
 // ArksApplicationCondition represents the state of a application.
 type ArksApplicationCondition struct {
@@ -73,6 +167,67 @@ type ArksApplicationCondition struct {
 	LastTransitionTime metav1.Time                  `json:"lastTransitionTime,omitempty"`
 	Reason             string                       `json:"reason,omitempty" description:"reason for the condition's last transition"`
 	Message            string                       `json:"message,omitempty" description:"human-readable message indicating details about last transition"`
+}
+
+// CoordinationPolicy controls the coordination strategy for prefill and decode roles.
+// When configured, prefill and decode deployment/update will proceed in a coordinated manner.
+// This is independent of PodGroupPolicy and can be used with LWS-level gang scheduling.
+type CoordinationPolicy struct {
+	// Scaling defines the coordination strategy for initial deployment and scale-up.
+	// Takes effect when prefill/decode scales from 0 replicas, or when replicas increase.
+	// +optional
+	Scaling *ScalingCoordination `json:"scaling,omitempty"`
+
+	// RollingUpdate defines the coordination strategy for rolling updates.
+	// Takes effect when Pod template changes (e.g., image, config) trigger a rolling update.
+	// +optional
+	RollingUpdate *RollingUpdateCoordination `json:"rollingUpdate,omitempty"`
+}
+
+// ScalingCoordination defines the coordination strategy for scaling operations.
+// Ensures prefill and decode are created proportionally to avoid resource waste.
+type ScalingCoordination struct {
+	// MaxSkew defines the maximum allowed difference in deployment progress between prefill and decode.
+	// For example, with "10%", the deployment progress difference cannot exceed 10%.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:default="10%"
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	MaxSkew string `json:"maxSkew,omitempty"`
+
+	// Progression defines when to proceed to the next batch of deployment.
+	// - OrderScheduled: Wait for all pods in current batch to be scheduled (have nodeName).
+	// - OrderReady: Wait for all pods in current batch to be ready.
+	// +optional
+	// +kubebuilder:default="OrderScheduled"
+	// +kubebuilder:validation:Enum=OrderScheduled;OrderReady
+	Progression string `json:"progression,omitempty"`
+}
+
+// RollingUpdateCoordination defines the coordination strategy for rolling updates.
+// Ensures prefill and decode are updated synchronously to avoid version inconsistency.
+type RollingUpdateCoordination struct {
+	// MaxSkew defines the maximum allowed difference in update progress between prefill and decode.
+	// For example, with "5%", the update progress difference cannot exceed 5%.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:default="5%"
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	MaxSkew string `json:"maxSkew,omitempty"`
+
+	// MaxUnavailable defines the maximum number of unavailable replicas during the update (percentage).
+	// If configured, overrides the MaxUnavailable in each role's RolloutStrategy.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	MaxUnavailable string `json:"maxUnavailable,omitempty"`
+
+	// Partition defines the partition point for rolling update (percentage).
+	// If configured, overrides the Partition in each role's RolloutStrategy.
+	// Only percentage values are supported.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]|[1-9][0-9]|100)%$`
+	Partition string `json:"partition,omitempty"`
 }
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -249,17 +404,76 @@ type ArksInstanceSpec struct {
 	InitContainers []corev1.Container `json:"initContainers"`
 }
 
+// ArksApplicationRouter defines the router role configuration.
+// Field layout aligns with ArksDisaggregatedRouter for migration parity:
+// the router image lives at the top-level Spec.RouterImage (not here).
+// Presence of the parent *Router pointer expresses "enabled" (no Enabled flag here).
+type ArksApplicationRouter struct {
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+	// +optional
+	CommandOverride []string `json:"commandOverride,omitempty"`
+	// +optional
+	Port int32 `json:"port,omitempty"`
+	// +optional
+	MetricPort int32 `json:"metricPort,omitempty"`
+	// +optional
+	RouterArgs []string `json:"routerArgs,omitempty"`
+	// +optional
+	InstanceSpec ArksInstanceSpec `json:"instanceSpec,omitempty"`
+}
+
+type ArksApplicationWorkload struct {
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+	// +optional
+	Size int `json:"size,omitempty"`
+	// +optional
+	LeaderCommandOverride []string `json:"leaderCommandOverride,omitempty"`
+	// +optional
+	WorkerCommandOverride []string `json:"workerCommandOverride,omitempty"`
+	// +optional
+	RuntimeCommonArgs []string `json:"runtimeCommonArgs,omitempty"`
+	// +optional
+	InstanceSpec ArksInstanceSpec `json:"instanceSpec,omitempty"`
+}
+
 // ArksApplicationSpec defines the desired state of ArksApplication.
+//
+// CRD-level validation rules enforce the allowed role combinations per mode:
+//
+//   mode=unified       → requires spec.unified
+//                        forbids  spec.prefill, spec.decode
+//                        spec.router is optional
+//
+//   mode=disaggregated → requires spec.prefill, spec.decode, spec.router
+//                        forbids  spec.unified
+//
+//   spec.coordinationPolicy is only valid when mode=disaggregated.
+//
+// Each rule reports an independent message so users get precise feedback
+// from `kubectl apply` admission failures.
+//
+// +kubebuilder:validation:XValidation:rule="self.mode != 'unified' || has(self.unified)",message="spec.unified is required when spec.mode is 'unified'"
+// +kubebuilder:validation:XValidation:rule="self.mode != 'unified' || !has(self.prefill)",message="spec.prefill must not be set when spec.mode is 'unified'"
+// +kubebuilder:validation:XValidation:rule="self.mode != 'unified' || !has(self.decode)",message="spec.decode must not be set when spec.mode is 'unified'"
+// +kubebuilder:validation:XValidation:rule="self.mode != 'disaggregated' || has(self.prefill)",message="spec.prefill is required when spec.mode is 'disaggregated'"
+// +kubebuilder:validation:XValidation:rule="self.mode != 'disaggregated' || has(self.decode)",message="spec.decode is required when spec.mode is 'disaggregated'"
+// +kubebuilder:validation:XValidation:rule="self.mode != 'disaggregated' || has(self.router)",message="spec.router is required when spec.mode is 'disaggregated'"
+// +kubebuilder:validation:XValidation:rule="self.mode != 'disaggregated' || !has(self.unified)",message="spec.unified must not be set when spec.mode is 'disaggregated'"
+// +kubebuilder:validation:XValidation:rule="!has(self.coordinationPolicy) || self.mode == 'disaggregated'",message="spec.coordinationPolicy is only valid when spec.mode is 'disaggregated'"
 type ArksApplicationSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	// +optional
-	Replicas int `json:"replicas"`
 
-	// Size defines the inference service group size.
-	// Default is 1 for single node inerfence service
+	// Mode selects the deployment topology.
+	// - unified (default): a single role (`unified`) runs the full inference pipeline,
+	//   optionally fronted by a router.
+	// - disaggregated: prefill + decode roles fronted by a router.
 	// +optional
-	Size int `json:"size"`
+	// +kubebuilder:default=unified
+	// +kubebuilder:validation:Enum=unified;disaggregated
+	Mode ArksApplicationMode `json:"mode,omitempty"`
 
 	// Runtime defines the inference runtime.
 	// Now support: vllm, sglang. Default vLLM.
@@ -268,34 +482,55 @@ type ArksApplicationSpec struct {
 	Runtime string `json:"runtime"` // vLLM, SGLang, Default vLLM.
 
 	// RuntimeImage defines the runtime container image URL.
+	// Shared by inference/prefill/decode roles.
 	// Specify this only when a specific version of the runtime image is required.
 	// Customized runtime container images must be compatible with the Runtime.
 	// Arks provides a default version of the runtime container image.
 	// +optional
-	RuntimeImage string `json:"runtimeImage"` // The image of vLLM, SGLang or Dynamo.
+	RuntimeImage string `json:"runtimeImage,omitempty"`
 
 	// RuntimeImagePullSecrets defines the runtime image pull secret.
 	// You can specify the image pull secrets for the private image registry.
 	// +optional
-	RuntimeImagePullSecrets []corev1.LocalObjectReference `json:"runtimeImagePullSecrets"`
+	RuntimeImagePullSecrets []corev1.LocalObjectReference `json:"runtimeImagePullSecrets,omitempty"`
 
 	Model corev1.LocalObjectReference `json:"model"`
 
 	// ServedModelName defines a custom model name.
 	// +optional
-	ServedModelName string `json:"servedModelName"`
-
-	// +optional
-	TensorParallelSize int `json:"tensorParallelSize"`
-
-	// +optional
-	RuntimeCommonArgs []string `json:"runtimeCommonArgs"`
-
-	InstanceSpec ArksInstanceSpec `json:"instanceSpec"`
+	ServedModelName string `json:"servedModelName,omitempty"`
 
 	// +optional
 	// +kubebuilder:validation:Immutable
-	PodGroupPolicy *PodGroupPolicy `json:"podGroupPolicy"`
+	PodGroupPolicy *ArksPodGroupPolicy `json:"podGroupPolicy,omitempty"`
+
+	// CoordinationPolicy controls the coordinated scaling and rolling-update
+	// strategy across roles (disaggregated mode only).
+	// +optional
+	CoordinationPolicy *CoordinationPolicy `json:"coordinationPolicy,omitempty"`
+
+	// Unified defines the unified inference role (single role running the full
+	// inference pipeline). Required in unified mode.
+	// +optional
+	Unified *ArksApplicationWorkload `json:"unified,omitempty"`
+
+	// Prefill defines the prefill role. Required in disaggregated mode.
+	// +optional
+	Prefill *ArksApplicationWorkload `json:"prefill,omitempty"`
+
+	// Decode defines the decode role. Required in disaggregated mode.
+	// +optional
+	Decode *ArksApplicationWorkload `json:"decode,omitempty"`
+
+	// RouterImage defines the router container image. Used when Router is set.
+	// +optional
+	RouterImage string `json:"routerImage,omitempty"`
+
+	// Router defines the router role.
+	// In unified mode, presence enables router (nil = no router).
+	// In disaggregated mode, this field is required.
+	// +optional
+	Router *ArksApplicationRouter `json:"router,omitempty"`
 }
 
 // ArksApplicationStatus defines the observed state of ArksApplication.
@@ -303,10 +538,23 @@ type ArksApplicationStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	Phase string `json:"phase"`
+	// +optional
+	Mode ArksApplicationMode `json:"mode,omitempty"`
+	// +optional
+	TrafficTarget ArksApplicationTrafficTarget `json:"trafficTarget,omitempty"`
 
 	Replicas        int32 `json:"replicas"`
 	ReadyReplicas   int32 `json:"readyReplicas"`
 	UpdatedReplicas int32 `json:"updatedReplicas"`
+
+	// +optional
+	Unified ArksRoleStatus `json:"unified,omitempty"`
+	// +optional
+	Router ArksRoleStatus `json:"router,omitempty"`
+	// +optional
+	Prefill ArksRoleStatus `json:"prefill,omitempty"`
+	// +optional
+	Decode ArksRoleStatus `json:"decode,omitempty"`
 
 	Conditions []ArksApplicationCondition `json:"conditions,omitempty"`
 }
@@ -316,6 +564,7 @@ type ArksApplicationStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="The current phase of the application"
+// +kubebuilder:printcolumn:name="Mode",type="string",JSONPath=".spec.mode",description="The inference topology mode"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:printcolumn:name="Replicas",type="string",JSONPath=".status.replicas"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.readyReplicas"
