@@ -179,21 +179,31 @@ The default router image is the sglang router and is only valid when
 router binary in **unified** mode, supply both `spec.routerImage` and
 `spec.router.commandOverride`:
 
+Two equivalent ways to write the override:
+
 ```yaml
+# (a) put the whole launch script inside commandOverride; leave routerArgs empty
 spec:
-  mode: unified
-  runtime: vllm
-  runtimeImage: <vllm-image>
-  routerImage: <custom-router-image>
-  unified:
-    replicas: 2
-    size: 1
-    runtimeCommonArgs: [...]
-    instanceSpec: {...}
   router:
-    commandOverride: ["/bin/sh", "-c", "your-router-cmd ..."]
-    routerArgs: [--port, "8080"]
+    commandOverride: ["/bin/sh", "-c", "python3 -m my_router --port 8080"]
+    # routerArgs: []   # omit
 ```
+
+```yaml
+# (b) put the binary in commandOverride, the CLI flags in routerArgs
+#     (commandOverride -> Container.Command, routerArgs -> Container.Args)
+spec:
+  router:
+    commandOverride: ["python3", "-m", "my_router"]
+    routerArgs: ["--port", "8080"]
+```
+
+Both yield `python3 -m my_router --port 8080` inside the container.
+
+> Note: with the `/bin/sh -c "script"` shell form, anything in `routerArgs`
+> becomes the shell's positional parameters (`$0`, `$1`, ...), not part of
+> the script. Use form (a) and put your flags inside the script, or use
+> form (b) without `-c`.
 
 Validation rules:
 - `unified + router + runtime != sglang` requires both `spec.routerImage`

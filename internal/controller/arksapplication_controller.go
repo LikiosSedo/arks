@@ -566,6 +566,7 @@ func (r *ArksApplicationReconciler) buildRouterRole(ctx context.Context, applica
 	}
 	envs := append([]corev1.EnvVar{}, router.InstanceSpec.Env...)
 	var commands []string
+	var args []string
 	// Always compute the controller-generated router command when possible;
 	// it is exposed as ARKS_ROUTER_COMMAND so a commandOverride can compose
 	// on top of the original command (mirrors the legacy PD CRD semantics).
@@ -577,6 +578,15 @@ func (r *ArksApplicationReconciler) buildRouterRole(ctx context.Context, applica
 	}
 	if len(router.CommandOverride) > 0 {
 		commands = router.CommandOverride
+		// router.RouterArgs is passed as Container.Args so a binary-style
+		// commandOverride (e.g. ["python3", "-m", "my_router"]) can receive
+		// CLI flags via routerArgs. With shell-style commandOverride
+		// (e.g. ["/bin/sh", "-c", "script"]) routerArgs become shell
+		// positional parameters; users who don't want that should leave
+		// routerArgs empty and put their flags inside the script.
+		if len(router.RouterArgs) > 0 {
+			args = append(args, router.RouterArgs...)
+		}
 		if generatedRouterCommand != "" {
 			envs = append(envs, corev1.EnvVar{Name: "ARKS_ROUTER_COMMAND", Value: generatedRouterCommand})
 		}
@@ -590,6 +600,9 @@ func (r *ArksApplicationReconciler) buildRouterRole(ctx context.Context, applica
 			}
 			generatedRouterCommand = command
 		}
+		// The default sglang router path already appended router.RouterArgs
+		// inside generateRouterCommand, so we deliberately leave args nil
+		// to avoid double-passing them.
 		commands = []string{"/bin/bash", "-c", generatedRouterCommand}
 	}
 
@@ -655,6 +668,7 @@ func (r *ArksApplicationReconciler) buildRouterRole(ctx context.Context, applica
 				Name:            "main",
 				Image:           image,
 				Command:         commands,
+				Args:            args,
 				Resources:       instance.Resources,
 				SecurityContext: instance.SecurityContext,
 				ReadinessProbe:  readinessProbe,

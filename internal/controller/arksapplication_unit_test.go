@@ -357,6 +357,39 @@ func TestBuildUnifiedRoleLeaderWorkerOverride(t *testing.T) {
 	if !strings.Contains(leaderEnv, "sglang.launch_server") {
 		t.Fatalf("ARKS_LEADER_COMMAND should contain the sglang command, got %q", leaderEnv)
 	}
+
+	// Worker side: unmarshal the worker patch and assert the override
+	// replaces Container.Command + ARKS_WORKER_COMMAND env is the raw
+	// sglang worker command (not the /bin/bash -c wrapper).
+	var workerPatch corev1.PodTemplateSpec
+	if err := json.Unmarshal(role.LeaderWorkerSet.PatchWorkerTemplate.Raw, &workerPatch); err != nil {
+		t.Fatalf("worker patch is not a valid PodTemplateSpec: %v", err)
+	}
+	if len(workerPatch.Spec.Containers) != 1 {
+		t.Fatalf("worker patch expects exactly 1 container, got %d", len(workerPatch.Spec.Containers))
+	}
+	workerContainer := workerPatch.Spec.Containers[0]
+	if got, want := workerContainer.Command[0], "/bin/sh"; got != want {
+		t.Fatalf("worker Command[0] = %q, want %q (override should replace default)", got, want)
+	}
+	if !strings.Contains(strings.Join(workerContainer.Command, " "), "custom-worker") {
+		t.Fatalf("worker Command should carry the override, got %v", workerContainer.Command)
+	}
+	var workerEnv string
+	for _, e := range workerContainer.Env {
+		if e.Name == "ARKS_WORKER_COMMAND" {
+			workerEnv = e.Value
+		}
+	}
+	if workerEnv == "" {
+		t.Fatal("ARKS_WORKER_COMMAND env var missing when workerCommandOverride is set")
+	}
+	if strings.HasPrefix(workerEnv, "/bin/bash -c ") {
+		t.Fatalf("ARKS_WORKER_COMMAND should hold the RAW sglang command, but starts with /bin/bash -c: %q", workerEnv)
+	}
+	if !strings.Contains(workerEnv, "sglang.launch_server") {
+		t.Fatalf("ARKS_WORKER_COMMAND should contain the sglang command, got %q", workerEnv)
+	}
 }
 
 // TestBuildUnifiedRoleWorkerPatchLabels covers the size>1 distributed
@@ -432,6 +465,90 @@ func TestBuildRouterRoleARKSRouterCommandEnv(t *testing.T) {
 	if !strings.Contains(routerEnv, "sglang_router") {
 		t.Fatalf("ARKS_ROUTER_COMMAND should reference sglang_router default, got %q", routerEnv)
 	}
+}
+
+// TestBuildRouterRoleArgsWithCommandOverride covers routerArgs semantics
+// when commandOverride is set:
+//   - routerArgs is passed to Container.Args (K8s Command+Args convention),
+//     so binary-style commandOverride can receive CLI flags via routerArgs
+//   - ARKS_ROUTER_COMMAND env is still injected with the default sglang
+//     router command for composability
+// And the default sglang path (no commandOverride) does NOT pass routerArgs
+// via Container.Args because generateRouterCommand already appended them
+// inside the generated command string.
+func TestBuildRouterRoleArgsWithCommandOverride(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 to scheme: %v", err)
+	}
+	if err := arksv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add arksv1 to scheme: %v", err)
+	}
+
+	// (a) commandOverride + routerArgs together → Command + Args both set
+	appA := newTestArksApplication()
+	appA.Name = "t-router-args-a"
+	appA.Namespace = "default"
+	appA.Spec.Runtime = string(arksv1.ArksRuntimeVLLM)
+	appA.Spec.RouterImage = "x"
+	appA.Spec.Router = &arksv1.ArksApplicationRouter{
+		CommandOverride: []string{"python3", "-m", "my_router"},
+		RouterArgs:      []string{"--port", "8080", "--policy", "round_robin"},
+		InstanceSpec:    arksv1.ArksInstanceSpec{ServiceAccountName: "router-sa"},
+	}
+	rA := &ArksApplicationReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(appA).Build(),
+		Scheme: scheme,
+	}
+	roleA, err := rA.buildRouterRole(context.Background(), appA)
+	if err != nil {
+		t.Fatalf("buildRouterRole (case a) returned error: %v", err)
+	}
+	cA := roleA.TemplateSource.Template.Spec.Containers[0]
+	if got, want := cA.Command, []string{"python3", "-m", "my_router"}; !reflectStringSliceEqual(got, want) {
+		t.Fatalf("case (a) Container.Command = %v, want %v", got, want)
+	}
+	if got, want := cA.Args, []string{"--port", "8080", "--policy", "round_robin"}; !reflectStringSliceEqual(got, want) {
+		t.Fatalf("case (a) Container.Args = %v, want %v (routerArgs should be passed as Args)", got, want)
+	}
+
+	// (b) sglang default path with routerArgs → Args is NIL because
+	//     routerArgs already baked into generated Command via -c "..."
+	appB := newTestArksApplication()
+	appB.Name = "t-router-args-b"
+	appB.Namespace = "default"
+	appB.Spec.Runtime = string(arksv1.ArksRuntimeSGLang)
+	appB.Spec.Router = &arksv1.ArksApplicationRouter{
+		RouterArgs:   []string{"--custom-flag", "yes"},
+		InstanceSpec: arksv1.ArksInstanceSpec{ServiceAccountName: "router-sa"},
+	}
+	rB := &ArksApplicationReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(appB).Build(),
+		Scheme: scheme,
+	}
+	roleB, err := rB.buildRouterRole(context.Background(), appB)
+	if err != nil {
+		t.Fatalf("buildRouterRole (case b) returned error: %v", err)
+	}
+	cB := roleB.TemplateSource.Template.Spec.Containers[0]
+	if len(cB.Args) != 0 {
+		t.Fatalf("case (b) Container.Args = %v, want empty (default sglang path should not double-pass routerArgs)", cB.Args)
+	}
+	if !strings.Contains(cB.Command[len(cB.Command)-1], "--custom-flag yes") {
+		t.Fatalf("case (b) generated Command should contain '--custom-flag yes', got %v", cB.Command)
+	}
+}
+
+func reflectStringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestValidateDisaggregatedRuntime covers the validate fail-fast for
