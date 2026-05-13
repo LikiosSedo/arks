@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -310,6 +312,209 @@ func TestSyncApplicationAggregateStatus(t *testing.T) {
 				t.Fatalf("UpdatedReplicas = %d, want %d", tt.app.Status.UpdatedReplicas, tt.want.UpdatedReplicas)
 			}
 		})
+	}
+}
+
+// ---- regression tests for the command override + worker label fixes ----
+
+// TestBuildUnifiedRoleLeaderWorkerOverride covers:
+//   - unified.leaderCommandOverride replaces Container.Command for the
+//     leader pod
+//   - the controller-generated leader command is exposed as
+//     ARKS_LEADER_COMMAND env on the leader container
+//   - the value of ARKS_LEADER_COMMAND is the RAW command string (not
+//     wrapped in /bin/bash -c), so user override scripts can
+//     `eval "$ARKS_LEADER_COMMAND"` without double-shell quoting
+func TestBuildUnifiedRoleLeaderWorkerOverride(t *testing.T) {
+	r := &ArksApplicationReconciler{}
+	app := newTestArksApplication()
+	app.Spec.Runtime = string(arksv1.ArksRuntimeSGLang)
+	app.Spec.Unified.LeaderCommandOverride = []string{"/bin/sh", "-c", "echo custom-leader; eval \"$ARKS_LEADER_COMMAND\""}
+	app.Spec.Unified.WorkerCommandOverride = []string{"/bin/sh", "-c", "echo custom-worker"}
+	model := newTestArksModel()
+
+	role, err := r.buildUnifiedRole(app, model)
+	if err != nil {
+		t.Fatalf("buildUnifiedRole returned error: %v", err)
+	}
+
+	leaderContainer := role.TemplateSource.Template.Spec.Containers[0]
+	if got, want := leaderContainer.Command[0], "/bin/sh"; got != want {
+		t.Fatalf("leader Command[0] = %q, want %q (override should replace default)", got, want)
+	}
+	var leaderEnv string
+	for _, e := range leaderContainer.Env {
+		if e.Name == "ARKS_LEADER_COMMAND" {
+			leaderEnv = e.Value
+		}
+	}
+	if leaderEnv == "" {
+		t.Fatal("ARKS_LEADER_COMMAND env var missing when leaderCommandOverride is set")
+	}
+	if strings.HasPrefix(leaderEnv, "/bin/bash -c ") {
+		t.Fatalf("ARKS_LEADER_COMMAND should hold the RAW sglang command, but starts with /bin/bash -c: %q", leaderEnv)
+	}
+	if !strings.Contains(leaderEnv, "sglang.launch_server") {
+		t.Fatalf("ARKS_LEADER_COMMAND should contain the sglang command, got %q", leaderEnv)
+	}
+}
+
+// TestBuildUnifiedRoleWorkerPatchLabels covers the size>1 distributed
+// inference fix: worker pods must carry arks.ai/role=unified +
+// arks.ai/work-load-role=worker, otherwise the unified Service selector
+// (arks.ai/work-load-role=leader) would also match them.
+func TestBuildUnifiedRoleWorkerPatchLabels(t *testing.T) {
+	r := &ArksApplicationReconciler{}
+	app := newTestArksApplication()
+	app.Spec.Unified.Size = 2 // multi-node LWS group
+	model := newTestArksModel()
+
+	role, err := r.buildUnifiedRole(app, model)
+	if err != nil {
+		t.Fatalf("buildUnifiedRole returned error: %v", err)
+	}
+
+	raw := role.LeaderWorkerSet.PatchWorkerTemplate.Raw
+	var patch corev1.PodTemplateSpec
+	if err := json.Unmarshal(raw, &patch); err != nil {
+		t.Fatalf("worker patch is not a valid PodTemplateSpec: %v", err)
+	}
+	if patch.ObjectMeta.Labels[arksv1.ArksControllerKeyRole] != "unified" {
+		t.Fatalf("worker patch arks.ai/role = %q, want unified", patch.ObjectMeta.Labels[arksv1.ArksControllerKeyRole])
+	}
+	if patch.ObjectMeta.Labels[arksv1.ArksControllerKeyWorkLoadRole] != arksv1.ArksWorkLoadRoleWorker {
+		t.Fatalf("worker patch arks.ai/work-load-role = %q, want %q",
+			patch.ObjectMeta.Labels[arksv1.ArksControllerKeyWorkLoadRole], arksv1.ArksWorkLoadRoleWorker)
+	}
+}
+
+// TestBuildRouterRoleARKSRouterCommandEnv covers the router env injection
+// fix: when router.commandOverride is set on an sglang application, the
+// controller-generated default router command is exposed as
+// ARKS_ROUTER_COMMAND to the router container so override scripts can
+// compose on top of the original.
+func TestBuildRouterRoleARKSRouterCommandEnv(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 to scheme: %v", err)
+	}
+	if err := arksv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add arksv1 to scheme: %v", err)
+	}
+	app := newTestArksApplication()
+	app.Name = "t-router-env"
+	app.Namespace = "default"
+	app.Spec.Runtime = string(arksv1.ArksRuntimeSGLang)
+	app.Spec.Router = &arksv1.ArksApplicationRouter{
+		CommandOverride: []string{"/bin/sh", "-c", "echo custom; eval \"$ARKS_ROUTER_COMMAND\""},
+		InstanceSpec:    arksv1.ArksInstanceSpec{ServiceAccountName: "router-sa"},
+	}
+
+	r := &ArksApplicationReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(app).Build(),
+		Scheme: scheme,
+	}
+	role, err := r.buildRouterRole(context.Background(), app)
+	if err != nil {
+		t.Fatalf("buildRouterRole returned error: %v", err)
+	}
+
+	container := role.TemplateSource.Template.Spec.Containers[0]
+	var routerEnv string
+	for _, e := range container.Env {
+		if e.Name == "ARKS_ROUTER_COMMAND" {
+			routerEnv = e.Value
+		}
+	}
+	if routerEnv == "" {
+		t.Fatal("ARKS_ROUTER_COMMAND env var missing when router.commandOverride is set on an sglang app")
+	}
+	if !strings.Contains(routerEnv, "sglang_router") {
+		t.Fatalf("ARKS_ROUTER_COMMAND should reference sglang_router default, got %q", routerEnv)
+	}
+}
+
+// TestValidateDisaggregatedRuntime covers the validate fail-fast for
+// non-sglang disaggregated mode plus the ordering fix (disagg runtime
+// limit is reported before router-image requirements).
+func TestValidateDisaggregatedRuntime(t *testing.T) {
+	r := &ArksApplicationReconciler{}
+
+	// disaggregated + vllm should be rejected, and the error must be about
+	// the disagg runtime restriction (NOT about routerImage/commandOverride).
+	app := &arksv1.ArksApplication{
+		Spec: arksv1.ArksApplicationSpec{
+			Mode:    arksv1.ArksApplicationModeDisaggregated,
+			Runtime: string(arksv1.ArksRuntimeVLLM),
+			Model:   corev1.LocalObjectReference{Name: "test-model"},
+			Prefill: &arksv1.ArksApplicationWorkload{Replicas: ptrInt32(1), Size: 1},
+			Decode:  &arksv1.ArksApplicationWorkload{Replicas: ptrInt32(1), Size: 1},
+			Router:  &arksv1.ArksApplicationRouter{Replicas: ptrInt32(1)},
+		},
+	}
+	err := r.validate(app)
+	if err == nil {
+		t.Fatal("expected validate error for mode=disaggregated runtime=vllm, got nil")
+	}
+	if !strings.Contains(err.Error(), "disaggregated mode currently only supports runtime=sglang") {
+		t.Fatalf("error should explain disagg runtime restriction, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "spec.routerImage") {
+		t.Fatalf("disagg runtime check should fire BEFORE router-image check, got: %v", err)
+	}
+
+	// disaggregated + sglang + full required fields should pass.
+	app.Spec.Runtime = string(arksv1.ArksRuntimeSGLang)
+	if err := r.validate(app); err != nil {
+		t.Fatalf("validate should pass for disaggregated+sglang, got: %v", err)
+	}
+}
+
+// TestValidateUnifiedCustomRouter covers: unified + non-sglang router
+// requires both spec.routerImage and spec.router.commandOverride.
+func TestValidateUnifiedCustomRouter(t *testing.T) {
+	r := &ArksApplicationReconciler{}
+
+	mk := func() *arksv1.ArksApplication {
+		return &arksv1.ArksApplication{
+			Spec: arksv1.ArksApplicationSpec{
+				Mode:    arksv1.ArksApplicationModeUnified,
+				Runtime: string(arksv1.ArksRuntimeVLLM),
+				Model:   corev1.LocalObjectReference{Name: "test-model"},
+				Unified: &arksv1.ArksApplicationWorkload{Replicas: ptrInt32(1), Size: 1},
+				Router:  &arksv1.ArksApplicationRouter{Replicas: ptrInt32(1)},
+			},
+		}
+	}
+
+	// missing both routerImage and commandOverride: reject
+	app := mk()
+	if err := r.validate(app); err == nil {
+		t.Fatal("expected validate error for unified+vllm+router without custom router fields")
+	} else if !strings.Contains(err.Error(), "router with runtime=vllm requires both spec.routerImage and spec.router.commandOverride") {
+		t.Fatalf("error should explain custom router requirement, got: %v", err)
+	}
+
+	// only routerImage: still reject (hasCustomRouter requires BOTH)
+	app = mk()
+	app.Spec.RouterImage = "x"
+	if err := r.validate(app); err == nil {
+		t.Fatal("expected validate error when only routerImage is set")
+	}
+
+	// only commandOverride: still reject (BOTH needed)
+	app = mk()
+	app.Spec.Router.CommandOverride = []string{"sleep", "1"}
+	if err := r.validate(app); err == nil {
+		t.Fatal("expected validate error when only commandOverride is set")
+	}
+
+	// both set: pass
+	app = mk()
+	app.Spec.RouterImage = "x"
+	app.Spec.Router.CommandOverride = []string{"sleep", "1"}
+	if err := r.validate(app); err != nil {
+		t.Fatalf("validate should pass for unified+vllm+full custom router, got: %v", err)
 	}
 }
 

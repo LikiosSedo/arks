@@ -263,18 +263,21 @@ func (r *ArksApplicationReconciler) validate(application *arksv1.ArksApplication
 		return fmt.Errorf("runtime not supported: %s", getArksApplicationRuntime(application))
 	}
 
+	// Check disaggregated runtime support BEFORE router-related checks: in
+	// disaggregated mode the controller only generates prefill/decode
+	// commands for sglang. Without this ordering, a user with
+	// mode=disaggregated + runtime=vllm would first see a misleading
+	// "supply routerImage/commandOverride" error, fix it, and still hit
+	// the disagg runtime restriction.
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated &&
+		getArksApplicationRuntime(application) != string(arksv1.ArksRuntimeSGLang) {
+		return fmt.Errorf("disaggregated mode currently only supports runtime=sglang, got %s", getArksApplicationRuntime(application))
+	}
+
 	if isApplicationRouterRequested(application) && getArksApplicationRuntime(application) != string(arksv1.ArksRuntimeSGLang) {
 		if !hasCustomRouter(application) {
 			return fmt.Errorf("router with runtime=%s requires both spec.routerImage and spec.router.commandOverride", getArksApplicationRuntime(application))
 		}
-	}
-
-	// disaggregated mode currently only generates prefill/decode commands
-	// for sglang; non-sglang disaggregated is not supported. Fail fast at
-	// validate time rather than at reconcile time.
-	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated &&
-		getArksApplicationRuntime(application) != string(arksv1.ArksRuntimeSGLang) {
-		return fmt.Errorf("disaggregated mode currently only supports runtime=sglang, got %s", getArksApplicationRuntime(application))
 	}
 
 	for _, instanceSpec := range r.instanceSpecsForValidation(application) {
@@ -445,21 +448,20 @@ func (r *ArksApplicationReconciler) buildUnifiedRole(application *arksv1.ArksApp
 	// LeaderCommandOverride / WorkerCommandOverride mirror the legacy
 	// ArksDisaggregatedWorkload semantics: when set, the user-provided
 	// command replaces the generated leader/worker command, and the
-	// original generated command is exposed as ARKS_LEADER_COMMAND /
-	// ARKS_WORKER_COMMAND so the override can compose on top of it.
+	// raw original command is exposed as ARKS_LEADER_COMMAND /
+	// ARKS_WORKER_COMMAND so the override can `eval "$ARKS_..."` or
+	// `sh -c "$ARKS_..."` without losing argument boundaries.
 	leaderEnvs := append([]corev1.EnvVar{}, envs...)
-	leaderCommands := leaderCommand
+	leaderCommands := []string{"/bin/bash", "-c", leaderCommand}
 	if len(unified.LeaderCommandOverride) > 0 {
-		generated := strings.Join(leaderCommand, " ")
-		leaderEnvs = append(leaderEnvs, corev1.EnvVar{Name: "ARKS_LEADER_COMMAND", Value: generated})
+		leaderEnvs = append(leaderEnvs, corev1.EnvVar{Name: "ARKS_LEADER_COMMAND", Value: leaderCommand})
 		leaderCommands = unified.LeaderCommandOverride
 	}
 
 	workerEnvs := append([]corev1.EnvVar{}, envs...)
-	workerCommands := workerCommand
+	workerCommands := []string{"/bin/bash", "-c", workerCommand}
 	if len(unified.WorkerCommandOverride) > 0 {
-		generated := strings.Join(workerCommand, " ")
-		workerEnvs = append(workerEnvs, corev1.EnvVar{Name: "ARKS_WORKER_COMMAND", Value: generated})
+		workerEnvs = append(workerEnvs, corev1.EnvVar{Name: "ARKS_WORKER_COMMAND", Value: workerCommand})
 		workerCommands = unified.WorkerCommandOverride
 	}
 
@@ -1384,7 +1386,11 @@ func unifiedRuntimeCommonArgs(application *arksv1.ArksApplication) []string {
 	return application.Spec.Unified.RuntimeCommonArgs
 }
 
-func generateLeaderCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) ([]string, error) {
+// generateLeaderCommand returns the raw leader command string. Callers wrap
+// it with `/bin/bash -c` when assigning to Container.Command, and inject
+// the same raw string into ARKS_LEADER_COMMAND so override scripts can
+// `eval "$ARKS_LEADER_COMMAND"` without double-shell quoting issues.
+func generateLeaderCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) (string, error) {
 	switch getArksApplicationRuntime(application) {
 	case string(arksv1.ArksRuntimeVLLM):
 		args := "/bin/bash /vllm-workspace/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=$(LWS_GROUP_SIZE); python3 -m vllm.entrypoints.openai.api_server --port 8080"
@@ -1393,7 +1399,7 @@ func generateLeaderCommand(application *arksv1.ArksApplication, model *arksv1.Ar
 		for _, arg := range unifiedRuntimeCommonArgs(application) {
 			args = fmt.Sprintf("%s %s", args, arg)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	case string(arksv1.ArksRuntimeSGLang):
 		args := "python3 -m sglang.launch_server --dist-init-addr $(LWS_LEADER_ADDRESS):20000 --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) --trust-remote-code --host 0.0.0.0 --port 8080"
 		args = fmt.Sprintf("%s --model-path %s", args, generateModelPath(model))
@@ -1404,22 +1410,24 @@ func generateLeaderCommand(application *arksv1.ArksApplication, model *arksv1.Ar
 		if !strings.Contains(args, "enable-metrics") {
 			args = fmt.Sprintf("%s --enable-metrics", args)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	case string(arksv1.ArksRuntimeDynamo):
 		args := "dynamo run in=http out=dyn://$(LWS_LEADER_ADDRESS)"
 		for _, arg := range unifiedRuntimeCommonArgs(application) {
 			args = fmt.Sprintf("%s %s", args, arg)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	default:
-		return nil, fmt.Errorf("runtime not support")
+		return "", fmt.Errorf("runtime not support")
 	}
 }
 
-func generateWorkerCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) ([]string, error) {
+// generateWorkerCommand returns the raw worker command string. Same
+// wrapping/injection contract as generateLeaderCommand.
+func generateWorkerCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) (string, error) {
 	switch getArksApplicationRuntime(application) {
 	case string(arksv1.ArksRuntimeVLLM):
-		return []string{"/bin/bash", "-c", "/bin/bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS)"}, nil
+		return "/bin/bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS)", nil
 	case string(arksv1.ArksRuntimeSGLang):
 		args := "python3 -m sglang.launch_server --dist-init-addr $(LWS_LEADER_ADDRESS):20000 --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) --trust-remote-code"
 		args = fmt.Sprintf("%s --model-path %s", args, generateModelPath(model))
@@ -1430,16 +1438,16 @@ func generateWorkerCommand(application *arksv1.ArksApplication, model *arksv1.Ar
 		if !strings.Contains(args, "enable-metrics") {
 			args = fmt.Sprintf("%s --enable-metrics", args)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	case string(arksv1.ArksRuntimeDynamo):
 		args := fmt.Sprintf("dynamo run in=dyn://$(LWS_LEADER_ADDRESS) out=vllm %s", generateModelPath(model))
 		args = fmt.Sprintf("%s --model-name %s", args, getServedModelName(application))
 		for _, arg := range unifiedRuntimeCommonArgs(application) {
 			args = fmt.Sprintf("%s %s", args, arg)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	default:
-		return nil, fmt.Errorf("runtime not support")
+		return "", fmt.Errorf("runtime not support")
 	}
 }
 
