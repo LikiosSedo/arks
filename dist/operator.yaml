@@ -54125,7 +54125,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: scitixai/arks-operator:v0.2.0
+        image: registry-ap-southeast.scitix.ai/k8s/arks_pr:v1.0-d701270
         imagePullPolicy: Always
         livenessProbe:
           httpGet:

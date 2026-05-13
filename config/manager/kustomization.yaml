@@ -3,6 +3,6 @@ resources:
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
-- name: controller
-  newName: docker.io/scitixai/arks-operator
-  newTag: v0.2.0
+- name: scitixai/arks-operator
+  newName: registry-ap-southeast.scitix.ai/k8s/arks_pr
+  newTag: v1.0-d701270
