@@ -842,12 +842,15 @@ func (r *ArksApplicationReconciler) shouldRenderRouterRole(application *arksv1.A
 	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated {
 		return true
 	}
-	if isApplicationRouterRequested(application) {
-		return true
-	}
-	return application.Status.Mode == arksv1.ArksApplicationModeUnified &&
-		getApplicationMode(application) == arksv1.ArksApplicationModeUnified &&
-		application.Status.TrafficTarget == arksv1.ArksApplicationTrafficTargetRouter
+	// In unified mode the router role is rendered iff the user requested it
+	// (spec.router != nil). When the user removes spec.router, the role must
+	// be dropped immediately on the next reconcile; the controller still
+	// switches Service traffic from router to the engine pods through the
+	// TrafficTarget state machine. A brief endpoints gap is possible while
+	// the router Deployment terminates in parallel with the Service selector
+	// switch, but the engine pods are already running so most traffic
+	// continues uninterrupted via the in-cluster proxy's endpoint update.
+	return isApplicationRouterRequested(application)
 }
 
 func (r *ArksApplicationReconciler) isTrafficTargetReady(application *arksv1.ArksApplication, target arksv1.ArksApplicationTrafficTarget) bool {
