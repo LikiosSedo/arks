@@ -41,6 +41,13 @@ spec:
   router:  {replicas, commandOverride, port, metricPort, routerArgs, instanceSpec}
 ```
 
+**Command override semantics** (`leaderCommandOverride` / `workerCommandOverride`
+on workload roles, `commandOverride` on router): when set, the user-provided
+command replaces the controller-generated default. The original generated
+command is exposed to the container as `ARKS_LEADER_COMMAND`,
+`ARKS_WORKER_COMMAND`, or `ARKS_ROUTER_COMMAND` respectively, so the
+override script can compose on top of it.
+
 **Validation (CEL, enforced by API server):**
 
 | Mode | Required fields |
@@ -165,25 +172,40 @@ spec:
       resources: {limits: {cpu: "1", memory: 2Gi}, requests: {cpu: 500m, memory: 1Gi}}
 ```
 
-## Custom Router (non-sglang runtimes)
+## Custom Router (non-sglang runtimes, unified mode only)
 
-The default router image is the sglang router. For other runtimes (vllm /
-dynamo) or a custom router binary, supply both `spec.routerImage` and
+The default router image is the sglang router and is only valid when
+`spec.runtime = sglang`. For other runtimes (`vllm` / `dynamo`) or a custom
+router binary in **unified** mode, supply both `spec.routerImage` and
 `spec.router.commandOverride`:
 
 ```yaml
 spec:
-  mode: disaggregated
+  mode: unified
   runtime: vllm
   runtimeImage: <vllm-image>
   routerImage: <custom-router-image>
+  unified:
+    replicas: 2
+    size: 1
+    runtimeCommonArgs: [...]
+    instanceSpec: {...}
   router:
     commandOverride: ["/bin/sh", "-c", "your-router-cmd ..."]
     routerArgs: [--port, "8080"]
 ```
 
-When `runtime != sglang` and a router is requested, the controller rejects
-spec missing either `spec.routerImage` or `spec.router.commandOverride`.
+Validation rules:
+- `unified + router + runtime != sglang` requires both `spec.routerImage`
+  and `spec.router.commandOverride`.
+- `disaggregated` mode currently only supports `runtime: sglang`. The
+  controller rejects disaggregated CRs with non-sglang runtimes at the
+  validate step.
+
+When `spec.router.commandOverride` is set, the controller-generated default
+sglang router command (if applicable) is exposed to the router container as
+the `ARKS_ROUTER_COMMAND` environment variable, so an override script can
+compose on top of the original command.
 
 ## CoordinationPolicy (disaggregated only)
 
@@ -210,8 +232,8 @@ spec:
 
 | Transition | What happens | Service availability |
 |------------|--------------|----------------------|
-| `unified` → `unified + router` | Router rolled out in parallel; Service selector switched to router when ready; engine kept | Zero-downtime |
-| `unified + router` → `unified` | Service selector swapped back to engine first; router torn down on next reconcile | Zero-downtime |
+| `unified` → `unified + router` | Router rolled out in parallel; Service selector switched to router when ready; engine kept | Near zero-downtime |
+| `unified + router` → `unified` | Router role dropped; Service selector swap to engine pods on the same reconcile loop. The router Deployment terminates in parallel with the Service-selector swap, so a brief endpoints gap is possible. The engine pods stay alive throughout, so most traffic continues uninterrupted | Near zero-downtime (brief endpoints gap possible) |
 | `unified` ↔ `disaggregated` | Old role set torn down; new role set created; `Status.TrafficTargetReady=False, Reason=ModeSwitching` until the new mode's target is ready | Interrupted (`status.trafficTarget=pending`) |
 
 `status.trafficTarget` reflects which role the Service currently routes to:

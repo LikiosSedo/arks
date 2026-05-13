@@ -26,32 +26,39 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: app-qwen
 spec:
-  replicas: 1
-
-  # for multi-node infer
-  size: 2
-  tensorParallelSize: 2
-  # for single-node infer
-  # size: 1
-  # tensorParallelSize: 1
-
+  mode: unified
   runtime: vllm
-
-  # for V100 GPU
-  # extraOptions:
-  # - --dtype=half
-  # - --max-model-len 32768
 
   # Optional, default to spec.model.name
   # servedModelName: qwen-7b
   model:
     name: qwen-7b
-  instanceSpec:
-    resources:
-      limits:
-        nvidia.com/gpu: "1"
-      requests:
-        nvidia.com/gpu: "1"
+
+  unified:
+    replicas: 1
+
+    # for multi-node infer
+    size: 2
+    runtimeCommonArgs:
+      - --tensor-parallel-size
+      - "2"
+    # for single-node infer
+    # size: 1
+    # runtimeCommonArgs:
+    #   - --tensor-parallel-size
+    #   - "1"
+
+    # for V100 GPU, append:
+    #   - --dtype=half
+    #   - --max-model-len
+    #   - "32768"
+
+    instanceSpec:
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+        requests:
+          nvidia.com/gpu: "1"
 ---
 apiVersion: arks.ai/v1
 kind: ArksEndpoint

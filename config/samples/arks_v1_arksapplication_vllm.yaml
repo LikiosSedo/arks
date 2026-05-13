@@ -6,17 +6,21 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: app-qwen-vllm
 spec:
-  replicas: 1
-  size: 1
-  tensorParallelSize: 2
+  mode: unified
   runtime: vllm
   # Optional, default to spec.model.name
   # servedModelName: qwen-7b
   model:
     name: qwen-7b
-  instanceSpec:
-    resources:
-      limits:
-        nvidia.com/gpu: "1"
-      requests:
-        nvidia.com/gpu: "1"
+  unified:
+    replicas: 1
+    size: 1
+    runtimeCommonArgs:
+      - --tensor-parallel-size
+      - "2"
+    instanceSpec:
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+        requests:
+          nvidia.com/gpu: "1"
