@@ -269,6 +269,14 @@ func (r *ArksApplicationReconciler) validate(application *arksv1.ArksApplication
 		}
 	}
 
+	// disaggregated mode currently only generates prefill/decode commands
+	// for sglang; non-sglang disaggregated is not supported. Fail fast at
+	// validate time rather than at reconcile time.
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated &&
+		getArksApplicationRuntime(application) != string(arksv1.ArksRuntimeSGLang) {
+		return fmt.Errorf("disaggregated mode currently only supports runtime=sglang, got %s", getArksApplicationRuntime(application))
+	}
+
 	for _, instanceSpec := range r.instanceSpecsForValidation(application) {
 		if err := validateReservedModelPaths(instanceSpec); err != nil {
 			return err
@@ -433,14 +441,36 @@ func (r *ArksApplicationReconciler) buildUnifiedRole(application *arksv1.ArksApp
 
 	volumes, volumeMounts := buildModelVolumes(model, &unified.InstanceSpec)
 	envs := buildRuntimeEnvs(getArksApplicationRuntime(application), unified.InstanceSpec.Env)
-	podSpec := buildPodSpec(&unified.InstanceSpec, application.Spec.RuntimeImagePullSecrets, volumes, envs, image, leaderCommand)
+
+	// LeaderCommandOverride / WorkerCommandOverride mirror the legacy
+	// ArksDisaggregatedWorkload semantics: when set, the user-provided
+	// command replaces the generated leader/worker command, and the
+	// original generated command is exposed as ARKS_LEADER_COMMAND /
+	// ARKS_WORKER_COMMAND so the override can compose on top of it.
+	leaderEnvs := append([]corev1.EnvVar{}, envs...)
+	leaderCommands := leaderCommand
+	if len(unified.LeaderCommandOverride) > 0 {
+		generated := strings.Join(leaderCommand, " ")
+		leaderEnvs = append(leaderEnvs, corev1.EnvVar{Name: "ARKS_LEADER_COMMAND", Value: generated})
+		leaderCommands = unified.LeaderCommandOverride
+	}
+
+	workerEnvs := append([]corev1.EnvVar{}, envs...)
+	workerCommands := workerCommand
+	if len(unified.WorkerCommandOverride) > 0 {
+		generated := strings.Join(workerCommand, " ")
+		workerEnvs = append(workerEnvs, corev1.EnvVar{Name: "ARKS_WORKER_COMMAND", Value: generated})
+		workerCommands = unified.WorkerCommandOverride
+	}
+
+	podSpec := buildPodSpec(&unified.InstanceSpec, application.Spec.RuntimeImagePullSecrets, volumes, leaderEnvs, image, leaderCommands)
 	podSpec.Containers = []corev1.Container{
 		{
 			Name:            "instance",
 			Image:           image,
-			Command:         leaderCommand,
+			Command:         leaderCommands,
 			ImagePullPolicy: corev1.PullIfNotPresent,
-			Env:             envs,
+			Env:             leaderEnvs,
 			Resources:       unified.InstanceSpec.Resources,
 			VolumeMounts:    volumeMounts,
 			Ports:           []corev1.ContainerPort{{ContainerPort: 8080}},
@@ -452,12 +482,16 @@ func (r *ArksApplicationReconciler) buildUnifiedRole(application *arksv1.ArksApp
 	}
 
 	workerPatch, err := json.Marshal(corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: unified.InstanceSpec.Annotations,
+			Labels:      generateUnifiedLabels(application, arksv1.ArksWorkLoadRoleWorker),
+		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
 					Name:      "instance",
-					Command:   workerCommand,
+					Command:   workerCommands,
+					Env:       workerEnvs,
 					Resources: corev1.ResourceRequirements{},
 				},
 			},
@@ -530,14 +564,31 @@ func (r *ArksApplicationReconciler) buildRouterRole(ctx context.Context, applica
 	}
 	envs := append([]corev1.EnvVar{}, router.InstanceSpec.Env...)
 	var commands []string
-	if hasCustomRouter(application) {
-		commands = router.CommandOverride
-	} else {
-		command, err := r.generateRouterCommand(application, port, metricPort)
-		if err != nil {
-			return rbgv1alpha1.RoleSpec{}, err
+	// Always compute the controller-generated router command when possible;
+	// it is exposed as ARKS_ROUTER_COMMAND so a commandOverride can compose
+	// on top of the original command (mirrors the legacy PD CRD semantics).
+	generatedRouterCommand := ""
+	if getArksApplicationRuntime(application) == string(arksv1.ArksRuntimeSGLang) {
+		if c, err := r.generateRouterCommand(application, port, metricPort); err == nil {
+			generatedRouterCommand = c
 		}
-		commands = []string{"/bin/bash", "-c", command}
+	}
+	if len(router.CommandOverride) > 0 {
+		commands = router.CommandOverride
+		if generatedRouterCommand != "" {
+			envs = append(envs, corev1.EnvVar{Name: "ARKS_ROUTER_COMMAND", Value: generatedRouterCommand})
+		}
+	} else {
+		if generatedRouterCommand == "" {
+			// non-sglang without commandOverride is already rejected by
+			// validate(); reach here only when generateRouterCommand failed.
+			command, err := r.generateRouterCommand(application, port, metricPort)
+			if err != nil {
+				return rbgv1alpha1.RoleSpec{}, err
+			}
+			generatedRouterCommand = command
+		}
+		commands = []string{"/bin/bash", "-c", generatedRouterCommand}
 	}
 
 	replicas := int32(1)
