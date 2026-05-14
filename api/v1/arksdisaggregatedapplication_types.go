@@ -142,6 +142,7 @@ type ArksDisaggregatedApplicationSpec struct {
 	// Decode
 	Decode ArksDisaggregatedWorkload `json:"decode"`
 
+	// PodGroupPolicy controls RBG-level gang scheduling.
 	// +optional
 	// +kubebuilder:validation:Immutable
 	PodGroupPolicy *PodGroupPolicy `json:"podGroupPolicy"`

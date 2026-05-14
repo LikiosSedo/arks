@@ -6,20 +6,23 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: app-qwen
 spec:
-  replicas: 1
-  size: 1
-  tensorParallelSize: 2
-  extraOptions:
-    - --mem-fraction-static
-    - "0.7"
+  mode: unified
   runtime: sglang
   # Optional, default to spec.model.name
   # servedModelName: qwen-7b
   model:
     name: qwen-7b
-  instanceSpec:
-    resources:
-      limits:
-        nvidia.com/gpu: "1"
-      requests:
-        nvidia.com/gpu: "1"
+  unified:
+    replicas: 1
+    size: 1
+    runtimeCommonArgs:
+      - --tp
+      - "2"
+      - --mem-fraction-static
+      - "0.7"
+    instanceSpec:
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+        requests:
+          nvidia.com/gpu: "1"

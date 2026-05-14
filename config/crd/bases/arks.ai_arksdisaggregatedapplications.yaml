@@ -6322,8 +6322,7 @@ spec:
                 type: object
                 x-kubernetes-map-type: atomic
               podGroupPolicy:
-                description: PodGroupPolicy represents a PodGroup configuration for
-                  gang-scheduling.
+                description: PodGroupPolicy controls RBG-level gang scheduling.
                 properties:
                   kubeScheduling:
                     description: KubeScheduling plugin from the Kubernetes scheduler-plugins

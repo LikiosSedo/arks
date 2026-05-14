@@ -6,21 +6,25 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: app-qwen
 spec:
-  replicas: 1
-  size: 1
-  tensorParallelSize: 2
+  mode: unified
   runtime: dynamo
   servedModelName: myqwen-7b
   model:
     name: qwen-7b
-  instanceSpec:
-    env:
-    - name: ETCD_ENDPOINTS
-      value: http://dynamo-platform-etcd.dynamo-playground:2379
-    - name: NATS_SERVER
-      value: nats://dynamo-platform-nats.dynamo-playground:4222
-    resources:
-      limits:
-        nvidia.com/gpu: "1"
-      requests:
-        nvidia.com/gpu: "1"
+  unified:
+    replicas: 1
+    size: 1
+    runtimeCommonArgs:
+      - --tensor-parallel-size
+      - "2"
+    instanceSpec:
+      env:
+        - name: ETCD_ENDPOINTS
+          value: http://dynamo-platform-etcd.dynamo-playground:2379
+        - name: NATS_SERVER
+          value: nats://dynamo-platform-nats.dynamo-playground:4222
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+        requests:
+          nvidia.com/gpu: "1"

@@ -19,11 +19,15 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,7 +44,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	lwsapi "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	lwscli "sigs.k8s.io/lws/client-go/clientset/versioned"
 	rbgv1alpha1 "sigs.k8s.io/rbgs/api/workloads/v1alpha1"
 
@@ -53,7 +56,7 @@ const (
 	arksApplicationModelVolumeMountPath = "/models"
 )
 
-// ArksApplicationReconciler reconciles a ArksApplication object
+// ArksApplicationReconciler reconciles an ArksApplication object.
 type ArksApplicationReconciler struct {
 	client.Client
 	KubeClient *kubernetes.Clientset
@@ -69,48 +72,33 @@ const arksApplicationModelField = "spec.model.name"
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=rolebasedgroupsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=rolebasedgroups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=leaderworkerset.x-k8s.io,resources=leaderworkersets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the ArksApplication object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.20.4/pkg/reconcile
 func (r *ArksApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = logf.FromContext(ctx)
 
-	// TODO(user): your logic here
 	application := &arksv1.ArksApplication{}
 	if err := r.Client.Get(ctx, req.NamespacedName, application, &client.GetOptions{
-		Raw: &metav1.GetOptions{
-			ResourceVersion: "",
-		},
+		Raw: &metav1.GetOptions{ResourceVersion: ""},
 	}); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// remove model
 	if application.DeletionTimestamp != nil {
 		klog.Infof("application %s/%s: remove application", application.Namespace, application.Name)
 		return r.remove(ctx, application)
 	}
 
 	original := application.DeepCopy()
-
-	// reconcile model
 	result, err := r.reconcile(ctx, application)
 
-	// update application status
 	if statusErr := r.patchApplicationStatus(ctx, original, application); statusErr != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update status for application %s/%s (%s): %w", application.Namespace, application.Name, application.UID, statusErr)
 	}
 
-	// handle reconcile error
 	if err != nil {
 		klog.Errorf("failed to reconcile application %s/%s (%s): %q", application.Namespace, application.Name, application.UID, err)
 		return result, err
@@ -125,10 +113,7 @@ func (r *ArksApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &arksv1.ArksApplication{}, arksApplicationModelField, func(obj client.Object) []string {
 		app, ok := obj.(*arksv1.ArksApplication)
-		if !ok {
-			return nil
-		}
-		if app.Spec.Model.Name == "" {
+		if !ok || app.Spec.Model.Name == "" {
 			return nil
 		}
 		return []string{app.Spec.Model.Name}
@@ -137,12 +122,9 @@ func (r *ArksApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		WithOptions(controller.Options{
-			MaxConcurrentReconciles: 30,
-		}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 30}).
 		For(&arksv1.ArksApplication{}).
 		Named("arksapplication").
-		Owns(&lwsapi.LeaderWorkerSet{}).
 		Owns(&rbgv1alpha1.RoleBasedGroupSet{}).
 		Watches(&arksv1.ArksModel{}, handler.EnqueueRequestsFromMapFunc(r.requestsForModel)).
 		Watches(&rbgv1alpha1.RoleBasedGroup{}, handler.EnqueueRequestsFromMapFunc(r.requestsForRBG)).
@@ -150,56 +132,35 @@ func (r *ArksApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *ArksApplicationReconciler) remove(ctx context.Context, application *arksv1.ArksApplication) (ctrl.Result, error) {
-	// model is not be deleted
 	if application.DeletionTimestamp == nil {
 		return ctrl.Result{Requeue: true}, nil
 	}
 
 	serviceName := generateApplicationServiceName(application)
-	klog.Infof("application %s/%s: start to remove application service (%s)", application.Namespace, application.Name, serviceName)
-	if err := r.KubeClient.CoreV1().Services(application.Namespace).Delete(ctx, serviceName, metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			klog.Errorf("application %s/%s: failed to delete application service (%s): %q", application.Namespace, serviceName, serviceName, err)
-			return ctrl.Result{}, fmt.Errorf("failed to delete application service (%s): %q", serviceName, err)
-		}
+	if err := r.KubeClient.CoreV1().Services(application.Namespace).Delete(ctx, serviceName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to delete application service (%s): %q", serviceName, err)
 	}
-	klog.Infof("application %s/%s: remove application service (%s) successfully", application.Namespace, application.Name, serviceName)
 
-	klog.Infof("application %s/%s: start to remove application underlying workload", application.Namespace, application.Name)
-
-	// Try to delete RBGS
 	rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: application.Name}, rbgs); err != nil {
-		if !apierrors.IsNotFound(err) {
-			klog.Errorf("application %s/%s: failed to check RBGS: %q", application.Namespace, application.Name, err)
-			return ctrl.Result{}, fmt.Errorf("failed to check RBGS: %q", err)
-		}
-	} else {
+	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: application.Name}, rbgs); err == nil {
 		if err := r.Client.Delete(ctx, rbgs); err != nil && !apierrors.IsNotFound(err) {
-			klog.Errorf("application %s/%s: failed to delete underlying RBGS: %q", application.Namespace, application.Name, err)
 			return ctrl.Result{}, fmt.Errorf("failed to delete underlying RBGS: %q", err)
 		}
-		klog.Infof("application %s/%s: remove application underlying RBGS successfully", application.Namespace, application.Name)
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to check RBGS: %q", err)
 	}
 
-	// Try to delete LWS for backward compatibility
+	// Delete any legacy LWS with the old standalone name for cleanup compatibility.
 	if r.LWSClient != nil {
-		if err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Delete(ctx, application.Name, metav1.DeleteOptions{}); err != nil {
-			if !apierrors.IsNotFound(err) {
-				klog.Errorf("application %s/%s: failed to delete underlying LWS: %q", application.Namespace, serviceName, err)
-				return ctrl.Result{}, fmt.Errorf("failed to delete underlying LWS: %q", err)
-			}
-		} else {
-			klog.Infof("application %s/%s: remove application underlying LWS successfully", application.Namespace, application.Name)
+		if err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Delete(ctx, application.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed to delete legacy LWS: %q", err)
 		}
 	}
 
-	// remove finalizer
 	if err := r.removeFinalizerWithRetry(ctx, application); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to remove application finalizer: %w", err)
 	}
 
-	klog.Infof("application %s/%s: delete the application successfully", application.Namespace, application.Name)
 	return ctrl.Result{}, nil
 }
 
@@ -208,66 +169,35 @@ func (r *ArksApplicationReconciler) reconcile(ctx context.Context, application *
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if application.Status.Phase == string(arksv1.ArksApplicationPhaseFailed) {
-		return ctrl.Result{}, nil
-	}
-
 	if application.Status.Phase == "" {
 		application.Status.Phase = string(arksv1.ArksApplicationPhasePending)
 	}
 
 	initializeApplicationCondition(application)
 
-	appRuntime := getStandaloneApplicationRuntime(application)
-
 	if !hasFinalizer(application, arksApplicationControllerFinalizer) {
 		addFinalizer(application, arksApplicationControllerFinalizer)
-
 		if err := r.Client.Update(ctx, application); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to add application finalizer: %q", err)
 		}
+		return ctrl.Result{Requeue: true}, nil
+	}
 
-		// requeue to refresh application resource version
-		return ctrl.Result{
-			Requeue: true,
-		}, nil
+	if err := r.validate(application); err != nil {
+		application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+		updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "ValidationFailed", err.Error())
+		updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "ValidationFailed", err.Error())
+		return ctrl.Result{}, nil
 	}
 
 	if !checkApplicationCondition(application, arksv1.ArksApplicationPrecheck) {
 		application.Status.Phase = string(arksv1.ArksApplicationPhaseChecking)
-		switch appRuntime {
-		case string(arksv1.ArksRuntimeVLLM), string(arksv1.ArksRuntimeSGLang), string(arksv1.ArksRuntimeDynamo):
-		default:
-			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-			updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "RuntimeNotSupport", fmt.Sprintf("LWS not support the specified runtime: %s", appRuntime))
-			return ctrl.Result{}, nil
-		}
-
-		// precheck: volumes
-		for _, volume := range application.Spec.InstanceSpec.Volumes {
-			if volume.Name == arksApplicationModelVolumeName {
-				application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-				updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "ReservedVolumeName", "Volume name 'models' is reserved for ArksModel")
-				return ctrl.Result{}, nil
-			}
-		}
-		for _, volumeMount := range application.Spec.InstanceSpec.VolumeMounts {
-			if volumeMount.MountPath == arksApplicationModelVolumeMountPath {
-				application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-				updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "ReservedVolumeMountPath", "Volume mount path '/models' is reserved for ArksModel")
-				return ctrl.Result{}, nil
-			}
-		}
-
 		updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionTrue, "PrecheckPass", "The application passed the pre-checking")
-		klog.Infof("application %s/%s: pre-check successfully", application.Namespace, application.Name)
 	}
 
 	model := &arksv1.ArksModel{}
 	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: application.Namespace, Name: application.Spec.Model.Name}, model, &client.GetOptions{
-		Raw: &metav1.GetOptions{
-			ResourceVersion: "",
-		},
+		Raw: &metav1.GetOptions{ResourceVersion: ""},
 	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
@@ -277,748 +207,1371 @@ func (r *ArksApplicationReconciler) reconcile(ctx context.Context, application *
 		return ctrl.Result{}, err
 	}
 
-	// wait model to be ready
 	if !checkApplicationCondition(application, arksv1.ArksApplicationLoaded) {
 		application.Status.Phase = string(arksv1.ArksApplicationPhaseLoading)
 		switch model.Status.Phase {
 		case string(arksv1.ArksModelPhaseFailed):
 			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
 			updateApplicationCondition(application, arksv1.ArksApplicationLoaded, corev1.ConditionFalse, "ModelLoadFailed", "Failed to load the referenced model")
-			klog.Errorf("application %s/%s: failed to load the referenced model (%s), please check the state of the model", application.Namespace, application.Name, model.Name)
 			return ctrl.Result{}, nil
 		case string(arksv1.ArksModelReady):
 			updateApplicationCondition(application, arksv1.ArksApplicationLoaded, corev1.ConditionTrue, "ModelLoadSucceeded", "The referenced model is loaded")
-			klog.Infof("application %s/%s: the referenced model (%s) is loaded successfully", application.Namespace, application.Name, model.Name)
 		default:
-			klog.V(4).Infof("application %s/%s: wait for the referenced model (%s) be loaded", application.Namespace, application.Name, model.Name)
 			return ctrl.Result{}, nil
 		}
 	}
 
-	// Detect backend: LWS if exists, otherwise RBG
-	backend := r.determineBackend(ctx, application.Namespace, application.Name)
-	klog.Infof("application %s/%s: using backend: %s", application.Namespace, application.Name, backend)
-
-	// Always reconcile RBGS (regardless of Ready status) to support rolling updates
-	if backend == arksv1.ArksBackendRBG {
-		rbgs := &rbgv1alpha1.RoleBasedGroupSet{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      application.Name,
-				Namespace: application.Namespace,
-			},
-		}
-
-		result, err := controllerutil.CreateOrPatch(ctx, r.Client, rbgs, func() error {
-			// Generate desired RBGS spec
-			desiredRBGS, err := generateRBGS(application, model)
-			if err != nil {
-				return fmt.Errorf("failed to generate RBGS: %w", err)
-			}
-
-			// Update spec, labels to match desired state
-			rbgs.Spec = desiredRBGS.Spec
-			rbgs.Labels = desiredRBGS.Labels
-			// Annotations not set by generateRBGS, so we don't touch them
-
-			// Set owner reference
-			return controllerutil.SetControllerReference(application, rbgs, r.Scheme)
-		})
-
-		if err != nil {
-			application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-			updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayReconcileFailed", fmt.Sprintf("Failed to reconcile underlay: %q", err))
-			klog.Errorf("application %s/%s: failed to reconcile underlying RBGS: %q", application.Namespace, application.Name, err)
-			return ctrl.Result{}, fmt.Errorf("failed to reconcile underlying RBGS: %w", err)
-		}
-
-		// Log based on operation result
-		switch result {
-		case controllerutil.OperationResultCreated:
-			klog.Infof("application %s/%s: created underlying RBGS successfully", application.Namespace, application.Name)
-		case controllerutil.OperationResultUpdated:
-			klog.Infof("application %s/%s: updated underlying RBGS successfully (rolling update triggered)", application.Namespace, application.Name)
-		}
+	if err := r.reconcileRBGS(ctx, application, model); err != nil {
+		application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
+		updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayReconcileFailed", fmt.Sprintf("Failed to reconcile RBGS: %v", err))
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile RBGS: %w", err)
 	}
 
-	// start model service (initial setup only)
-	if !checkApplicationCondition(application, arksv1.ArksApplicationReady) {
-		application.Status.Phase = string(arksv1.ArksApplicationPhaseCreating)
-
-		// Use appropriate backend (LWS only, RBG already handled above)
-		if backend != arksv1.ArksBackendRBG {
-			// Use LWS backend (default)
-			if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, application.Name, metav1.GetOptions{}); err != nil {
-				if apierrors.IsNotFound(err) {
-					lws, err := generateLws(application, model)
-					if err != nil {
-						application.Status.Phase = string(arksv1.ArksApplicationPhaseFailed)
-						updateApplicationCondition(application, arksv1.ArksApplicationPrecheck, corev1.ConditionFalse, "UnderlayGenerateFailed", fmt.Sprintf("Failed to generate underlay: %q", err))
-						return ctrl.Result{}, fmt.Errorf("failed to generate underlying LWS: %q", err)
-					}
-					ctrl.SetControllerReference(application, lws, r.Scheme)
-
-					if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Create(ctx, lws, metav1.CreateOptions{}); err != nil {
-						if !apierrors.IsAlreadyExists(err) {
-							updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlayCreatedFailed", fmt.Sprintf("Failed to create underlay: %q", err))
-							klog.Errorf("application %s/%s: failed to create underlying LWS: %q", application.Namespace, application.Name, err)
-							return ctrl.Result{}, fmt.Errorf("failed to create underlying LWS: %q", err)
-						}
-					}
-					klog.Infof("application %s/%s: create underlying LWS successfully", application.Namespace, application.Name)
-				} else {
-					klog.Errorf("application %s/%s: failed to check the underlying LWS: %q", application.Namespace, application.Name, err)
-					return ctrl.Result{}, fmt.Errorf("failed to check the underlying LWS: %q", err)
-				}
-			}
-		}
-
-		// check service
-		serviceName := generateApplicationServiceName(application)
-		if _, err := r.KubeClient.CoreV1().Services(application.Namespace).Get(ctx, serviceName, metav1.GetOptions{}); err != nil {
-			if apierrors.IsNotFound(err) {
-				svc := &corev1.Service{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: application.Namespace,
-						Name:      serviceName,
-						Labels: map[string]string{
-							"prometheus-discovery": "true",
-							"managed-by":           "arks",
-						},
-					},
-					Spec: corev1.ServiceSpec{
-						Selector: map[string]string{
-							arksv1.ArksControllerKeyApplication:  application.Name,
-							arksv1.ArksControllerKeyWorkLoadRole: arksv1.ArksWorkLoadRoleLeader,
-						},
-						Ports: []corev1.ServicePort{
-							{
-								Protocol: corev1.ProtocolTCP,
-								Port:     8080,
-								Name:     "http",
-							},
-						},
-					},
-				}
-				ctrl.SetControllerReference(application, svc, r.Scheme)
-
-				if _, err := r.KubeClient.CoreV1().Services(application.Namespace).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
-					if !apierrors.IsAlreadyExists(err) {
-						klog.Errorf("application %s/%s: failed to create application service: %q", application.Namespace, application.Name, err)
-						return ctrl.Result{}, fmt.Errorf("failed to create application service: %q", err)
-					}
-				}
-				klog.Infof("application %s/%s: create application service successfully", application.Namespace, application.Name)
-			} else {
-				klog.Errorf("application %s/%s: failed to check the service: %q", application.Namespace, application.Name, err)
-				return ctrl.Result{}, fmt.Errorf("failed to check the service: %q", err)
-			}
-		}
-
-		application.Status.Phase = string(arksv1.ArksApplicationPhaseRunning)
-		updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionTrue, "Running", "The LLM service is running")
-		klog.Infof("application %s/%s: create underlying LWS successfully", application.Namespace, application.Name)
+	if err := r.syncApplicationStatus(ctx, application); err != nil {
+		klog.Warningf("application %s/%s: failed to sync status: %v", application.Namespace, application.Name, err)
 	}
 
-	// sync status
-	// backend already declared above, reuse it
-	if backend == arksv1.ArksBackendRBG {
-		// Only read RBGS status (don't modify RBGS in status sync phase)
-		rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
-		if err := r.Client.Get(ctx, types.NamespacedName{Name: application.Name, Namespace: application.Namespace}, rbgs); err != nil {
-			if !apierrors.IsNotFound(err) {
-				klog.Errorf("application %s/%s: failed to query the underlying RBGS status: %q", application.Namespace, application.Name, err)
-				return ctrl.Result{}, fmt.Errorf("failed to query underlying RBGS status: %w", err)
-			}
-			// RBGS not found - might be being created
-			klog.V(4).Infof("application %s/%s: underlying RBGS not found yet", application.Namespace, application.Name)
-		} else {
-			// List RBGs owned by this RBGS
-			rbgList := &rbgv1alpha1.RoleBasedGroupList{}
-			if err := r.Client.List(ctx, rbgList,
-				client.InNamespace(application.Namespace),
-				client.MatchingFields{"metadata.ownerReferences.name": rbgs.Name},
-			); err != nil {
-				// Fallback to manual filtering
-				if err := r.Client.List(ctx, rbgList, client.InNamespace(application.Namespace)); err != nil {
-					klog.Warningf("application %s/%s: failed to list RBGs: %v", application.Namespace, application.Name, err)
-					// Reset status
-					application.Status.Replicas = 0
-					application.Status.ReadyReplicas = 0
-					application.Status.UpdatedReplicas = 0
-				} else {
-					// Filter by owner
-					var filteredRBGs []rbgv1alpha1.RoleBasedGroup
-					for _, rbg := range rbgList.Items {
-						if metav1.GetControllerOf(&rbg) != nil && metav1.GetControllerOf(&rbg).Name == rbgs.Name {
-							filteredRBGs = append(filteredRBGs, rbg)
-						}
-					}
-					rbgList.Items = filteredRBGs
-				}
-			}
-
-			if len(rbgList.Items) == 0 {
-				klog.V(4).Infof("application %s/%s: no RBGs found for RBGS %s", application.Namespace, application.Name, rbgs.Name)
-				// Reset status
-				application.Status.Replicas = 0
-				application.Status.ReadyReplicas = 0
-				application.Status.UpdatedReplicas = 0
-			} else {
-				// Use first RBG for status
-				// TODO: When RBGS supports multiple replicas, aggregate status from all RBGs
-				rbg := &rbgList.Items[0]
-
-				// Sync status from RBG's RoleStatuses
-				for _, roleStatus := range rbg.Status.RoleStatuses {
-					if roleStatus.Name == "inference" {
-						application.Status.Replicas = roleStatus.Replicas
-						application.Status.ReadyReplicas = roleStatus.ReadyReplicas
-						// UpdatedReplicas from LWS
-						lwsName := fmt.Sprintf("%s-inference", rbg.Name)
-						if lws, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, lwsName, metav1.GetOptions{}); err == nil {
-							application.Status.UpdatedReplicas = lws.Status.UpdatedReplicas
-						}
-						break
-					}
-				}
-			}
-		}
-	} else {
-		if lws, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, application.Name, metav1.GetOptions{}); err != nil {
-			if !apierrors.IsNotFound(err) {
-				klog.Errorf("application %s/%s: failed to query the underlying LWS status: %q", application.Namespace, application.Name, err)
-				return ctrl.Result{}, fmt.Errorf("failed to query the underlying LWS status: %q", err)
-			}
-			application.Status.Phase = string(arksv1.ArksApplicationPhaseRunning)
-			application.Status.Replicas = 0
-			application.Status.ReadyReplicas = 0
-			application.Status.UpdatedReplicas = 0
-			updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "UnderlyingNotExit", "The underlying LWS doesn't exist")
-			klog.Errorf("application %s/%s: the underlying LWS doesn't exist", application.Namespace, application.Name)
-		} else {
-			application.Status.Replicas = lws.Status.Replicas
-			application.Status.ReadyReplicas = lws.Status.ReadyReplicas
-			application.Status.UpdatedReplicas = lws.Status.UpdatedReplicas
-		}
+	result, err := r.reconcileApplicationService(ctx, application)
+	if err != nil {
+		return result, err
 	}
 
-	return ctrl.Result{}, nil
+	r.updateApplicationPhase(application)
+	return result, nil
 }
 
-// GenerateLws generates LeaderWorkerSet for ArksApplication
-func generateLws(application *arksv1.ArksApplication, model *arksv1.ArksModel) (*lwsapi.LeaderWorkerSet, error) {
-	appRuntime := getStandaloneApplicationRuntime(application)
-
-	image, err := getApplicationRuntimeImage(application)
-	if err != nil {
-		return nil, err
+func (r *ArksApplicationReconciler) validate(application *arksv1.ArksApplication) error {
+	switch getApplicationMode(application) {
+	case arksv1.ArksApplicationModeUnified:
+		if application.Spec.Unified == nil {
+			return fmt.Errorf("unified spec is required when mode=unified")
+		}
+	case arksv1.ArksApplicationModeDisaggregated:
+		if application.Spec.Prefill == nil || application.Spec.Decode == nil {
+			return fmt.Errorf("prefill and decode specs are required when mode=disaggregated")
+		}
+		if application.Spec.Router == nil {
+			return fmt.Errorf("router spec is required when mode=disaggregated")
+		}
+	default:
+		return fmt.Errorf("unsupported mode: %s", getApplicationMode(application))
 	}
 
-	leaderCommand, err := generateLeaderCommand(application, model)
-	if err != nil {
-		return nil, err
+	switch getArksApplicationRuntime(application) {
+	case string(arksv1.ArksRuntimeVLLM), string(arksv1.ArksRuntimeSGLang), string(arksv1.ArksRuntimeDynamo):
+	default:
+		return fmt.Errorf("runtime not supported: %s", getArksApplicationRuntime(application))
 	}
 
-	workerCommand, err := generateWorkerCommand(application, model)
-	if err != nil {
-		return nil, err
+	// Check disaggregated runtime support BEFORE router-related checks: in
+	// disaggregated mode the controller only generates prefill/decode
+	// commands for sglang. Without this ordering, a user with
+	// mode=disaggregated + runtime=vllm would first see a misleading
+	// "supply routerImage/commandOverride" error, fix it, and still hit
+	// the disagg runtime restriction.
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated &&
+		getArksApplicationRuntime(application) != string(arksv1.ArksRuntimeSGLang) {
+		return fmt.Errorf("disaggregated mode currently only supports runtime=sglang, got %s", getArksApplicationRuntime(application))
 	}
 
-	lwsReplicas := application.Spec.Replicas
-	if lwsReplicas < 0 {
-		lwsReplicas = 0
-	}
-	lwsSize := application.Spec.Size
-	if lwsSize < 1 {
-		lwsSize = 1
-	}
-	klog.Infof("application %s/%s: replicas %d, size: %d", application.Namespace, application.Name, lwsReplicas, lwsSize)
-
-	volumes := []corev1.Volume{
-		{
-			Name: arksApplicationModelVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: model.Spec.Storage.PVC.Name,
-				},
-			},
-		},
-	}
-	volumes = append(volumes, application.Spec.InstanceSpec.Volumes...)
-
-	volumeMounts := []corev1.VolumeMount{
-		{
-			Name:      arksApplicationModelVolumeName,
-			MountPath: arksApplicationModelVolumeMountPath,
-			ReadOnly:  true,
-		},
-	}
-	volumeMounts = append(volumeMounts, application.Spec.InstanceSpec.VolumeMounts...)
-
-	envs := []corev1.EnvVar{}
-	envs = append(envs, application.Spec.InstanceSpec.Env...)
-	if appRuntime == string(arksv1.ArksRuntimeSGLang) {
-		envs = append(envs, corev1.EnvVar{
-			Name: "LWS_WORKER_INDEX",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{
-					FieldPath: "metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']",
-				},
-			},
-		})
+	if isApplicationRouterRequested(application) && getArksApplicationRuntime(application) != string(arksv1.ArksRuntimeSGLang) {
+		if !hasCustomRouter(application) {
+			return fmt.Errorf("router with runtime=%s requires both spec.routerImage and spec.router.commandOverride", getArksApplicationRuntime(application))
+		}
 	}
 
-	lws := &lwsapi.LeaderWorkerSet{
+	for _, instanceSpec := range r.instanceSpecsForValidation(application) {
+		if err := validateReservedModelPaths(instanceSpec); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *ArksApplicationReconciler) instanceSpecsForValidation(application *arksv1.ArksApplication) []*arksv1.ArksInstanceSpec {
+	var specs []*arksv1.ArksInstanceSpec
+	if application.Spec.Unified != nil {
+		specs = append(specs, &application.Spec.Unified.InstanceSpec)
+	}
+	if application.Spec.Router != nil {
+		specs = append(specs, &application.Spec.Router.InstanceSpec)
+	}
+	if application.Spec.Prefill != nil {
+		specs = append(specs, &application.Spec.Prefill.InstanceSpec)
+	}
+	if application.Spec.Decode != nil {
+		specs = append(specs, &application.Spec.Decode.InstanceSpec)
+	}
+	return specs
+}
+
+func validateReservedModelPaths(instanceSpec *arksv1.ArksInstanceSpec) error {
+	for _, volume := range instanceSpec.Volumes {
+		if volume.Name == arksApplicationModelVolumeName {
+			return fmt.Errorf("volume name %q is reserved for ArksModel", arksApplicationModelVolumeName)
+		}
+	}
+	for _, volumeMount := range instanceSpec.VolumeMounts {
+		if volumeMount.MountPath == arksApplicationModelVolumeMountPath {
+			return fmt.Errorf("volume mount path %q is reserved for ArksModel", arksApplicationModelVolumeMountPath)
+		}
+	}
+	return nil
+}
+
+func (r *ArksApplicationReconciler) reconcileRBGS(ctx context.Context, application *arksv1.ArksApplication, model *arksv1.ArksModel) error {
+	rbgs := &rbgv1alpha1.RoleBasedGroupSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: application.Namespace,
 			Name:      application.Name,
-			Labels: map[string]string{
-				arksv1.ArksControllerKeyApplication: application.Name,
-			},
-		},
-		Spec: lwsapi.LeaderWorkerSetSpec{
-			Replicas:      ptr.To(int32(lwsReplicas)),
-			StartupPolicy: lwsapi.LeaderCreatedStartupPolicy,
-			LeaderWorkerTemplate: lwsapi.LeaderWorkerTemplate{
-				RestartPolicy: lwsapi.RecreateGroupOnPodRestart,
-				Size:          ptr.To(int32(lwsSize)),
-				LeaderTemplate: &corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: application.Spec.InstanceSpec.Annotations,
-						Labels:      generateLwsLabels(application, arksv1.ArksWorkLoadRoleLeader),
-					},
-					Spec: corev1.PodSpec{
-						ServiceAccountName:            application.Spec.InstanceSpec.ServiceAccountName,
-						SchedulerName:                 application.Spec.InstanceSpec.SchedulerName,
-						Affinity:                      application.Spec.InstanceSpec.Affinity,
-						NodeSelector:                  application.Spec.InstanceSpec.NodeSelector,
-						Tolerations:                   application.Spec.InstanceSpec.Tolerations,
-						TerminationGracePeriodSeconds: application.Spec.InstanceSpec.TerminationGracePeriodSeconds,
-						ActiveDeadlineSeconds:         application.Spec.InstanceSpec.ActiveDeadlineSeconds,
-						DNSPolicy:                     application.Spec.InstanceSpec.DNSPolicy,
-						DNSConfig:                     application.Spec.InstanceSpec.DNSConfig,
-						AutomountServiceAccountToken:  application.Spec.InstanceSpec.AutomountServiceAccountToken,
-						NodeName:                      application.Spec.InstanceSpec.NodeName,
-						HostNetwork:                   application.Spec.InstanceSpec.HostNetwork,
-						HostPID:                       application.Spec.InstanceSpec.HostPID,
-						HostIPC:                       application.Spec.InstanceSpec.HostIPC,
-						ShareProcessNamespace:         application.Spec.InstanceSpec.ShareProcessNamespace,
-						SecurityContext:               application.Spec.InstanceSpec.PodSecurityContext,
-						Subdomain:                     application.Spec.InstanceSpec.Subdomain,
-						HostAliases:                   application.Spec.InstanceSpec.HostAliases,
-						PriorityClassName:             application.Spec.InstanceSpec.PriorityClassName,
-						Priority:                      application.Spec.InstanceSpec.Priority,
-						RuntimeClassName:              application.Spec.InstanceSpec.RuntimeClassName,
-						EnableServiceLinks:            application.Spec.InstanceSpec.EnableServiceLinks,
-						PreemptionPolicy:              application.Spec.InstanceSpec.PreemptionPolicy,
-						Overhead:                      application.Spec.InstanceSpec.Overhead,
-						TopologySpreadConstraints:     application.Spec.InstanceSpec.TopologySpreadConstraints,
-						SetHostnameAsFQDN:             application.Spec.InstanceSpec.SetHostnameAsFQDN,
-						OS:                            application.Spec.InstanceSpec.OS,
-						HostUsers:                     application.Spec.InstanceSpec.HostUsers,
-						SchedulingGates:               application.Spec.InstanceSpec.SchedulingGates,
-						ResourceClaims:                application.Spec.InstanceSpec.ResourceClaims,
-						ImagePullSecrets:              application.Spec.RuntimeImagePullSecrets,
-						InitContainers:                application.Spec.InstanceSpec.InitContainers,
-						Containers: []corev1.Container{
-							{
-								Name:         "leader",
-								Image:        image,
-								Command:      leaderCommand,
-								Resources:    application.Spec.InstanceSpec.Resources,
-								VolumeMounts: volumeMounts,
-								Env:          envs,
-								Ports: []corev1.ContainerPort{
-									{
-										ContainerPort: 8080,
-									},
-								},
-								ReadinessProbe: application.Spec.InstanceSpec.ReadinessProbe,
-								LivenessProbe:  application.Spec.InstanceSpec.LivenessProbe,
-							},
-						},
-						Volumes: volumes,
-					},
-				},
-				WorkerTemplate: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: application.Spec.InstanceSpec.Annotations,
-						Labels:      generateLwsLabels(application, arksv1.ArksWorkLoadRoleWorker),
-					},
-					Spec: corev1.PodSpec{
-						ServiceAccountName:            application.Spec.InstanceSpec.ServiceAccountName,
-						SchedulerName:                 application.Spec.InstanceSpec.SchedulerName,
-						Affinity:                      application.Spec.InstanceSpec.Affinity,
-						NodeSelector:                  application.Spec.InstanceSpec.NodeSelector,
-						Tolerations:                   application.Spec.InstanceSpec.Tolerations,
-						TerminationGracePeriodSeconds: application.Spec.InstanceSpec.TerminationGracePeriodSeconds,
-						ActiveDeadlineSeconds:         application.Spec.InstanceSpec.ActiveDeadlineSeconds,
-						DNSPolicy:                     application.Spec.InstanceSpec.DNSPolicy,
-						DNSConfig:                     application.Spec.InstanceSpec.DNSConfig,
-						AutomountServiceAccountToken:  application.Spec.InstanceSpec.AutomountServiceAccountToken,
-						NodeName:                      application.Spec.InstanceSpec.NodeName,
-						HostNetwork:                   application.Spec.InstanceSpec.HostNetwork,
-						HostPID:                       application.Spec.InstanceSpec.HostPID,
-						HostIPC:                       application.Spec.InstanceSpec.HostIPC,
-						ShareProcessNamespace:         application.Spec.InstanceSpec.ShareProcessNamespace,
-						SecurityContext:               application.Spec.InstanceSpec.PodSecurityContext,
-						Subdomain:                     application.Spec.InstanceSpec.Subdomain,
-						HostAliases:                   application.Spec.InstanceSpec.HostAliases,
-						PriorityClassName:             application.Spec.InstanceSpec.PriorityClassName,
-						Priority:                      application.Spec.InstanceSpec.Priority,
-						RuntimeClassName:              application.Spec.InstanceSpec.RuntimeClassName,
-						EnableServiceLinks:            application.Spec.InstanceSpec.EnableServiceLinks,
-						PreemptionPolicy:              application.Spec.InstanceSpec.PreemptionPolicy,
-						Overhead:                      application.Spec.InstanceSpec.Overhead,
-						TopologySpreadConstraints:     application.Spec.InstanceSpec.TopologySpreadConstraints,
-						SetHostnameAsFQDN:             application.Spec.InstanceSpec.SetHostnameAsFQDN,
-						OS:                            application.Spec.InstanceSpec.OS,
-						HostUsers:                     application.Spec.InstanceSpec.HostUsers,
-						SchedulingGates:               application.Spec.InstanceSpec.SchedulingGates,
-						ResourceClaims:                application.Spec.InstanceSpec.ResourceClaims,
-						ImagePullSecrets:              application.Spec.RuntimeImagePullSecrets,
-						InitContainers:                application.Spec.InstanceSpec.InitContainers,
-						Containers: []corev1.Container{
-							{
-								Name:         "worker",
-								Image:        image,
-								Command:      workerCommand,
-								Resources:    application.Spec.InstanceSpec.Resources,
-								VolumeMounts: volumeMounts,
-								Env:          envs,
-							},
-						},
-						Volumes: volumes,
-					},
-				},
-			},
+			Namespace: application.Namespace,
 		},
 	}
 
-	return lws, nil
+	result, err := controllerutil.CreateOrPatch(ctx, r.Client, rbgs, func() error {
+		desired, err := r.generateRBGS(ctx, application, model)
+		if err != nil {
+			return err
+		}
+		if !rbgsSpecSemanticallyEqual(rbgs.Spec, desired.Spec) {
+			rbgs.Spec = desired.Spec
+		}
+		rbgs.Labels = desired.Labels
+		return controllerutil.SetControllerReference(application, rbgs, r.Scheme)
+	})
+	if err != nil {
+		return err
+	}
+
+	if result != controllerutil.OperationResultNone {
+		klog.Infof("application %s/%s: %s RBGS successfully", application.Namespace, application.Name, result)
+	}
+	return nil
 }
 
-func generateRBGS(application *arksv1.ArksApplication, model *arksv1.ArksModel) (*rbgv1alpha1.RoleBasedGroupSet, error) {
-	appRuntime := getStandaloneApplicationRuntime(application)
+func (r *ArksApplicationReconciler) generateRBGS(ctx context.Context, application *arksv1.ArksApplication, model *arksv1.ArksModel) (*rbgv1alpha1.RoleBasedGroupSet, error) {
+	var roles []rbgv1alpha1.RoleSpec
 
-	image, err := getApplicationRuntimeImage(application)
-	if err != nil {
-		return nil, err
+	switch getApplicationMode(application) {
+	case arksv1.ArksApplicationModeUnified:
+		unifiedRole, err := r.buildUnifiedRole(application, model)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build unified role: %w", err)
+		}
+		roles = append(roles, unifiedRole)
+		if r.shouldRenderRouterRole(application) {
+			routerRole, err := r.buildRouterRole(ctx, application)
+			if err != nil {
+				return nil, fmt.Errorf("failed to build router role: %w", err)
+			}
+			roles = append(roles, routerRole)
+		}
+	case arksv1.ArksApplicationModeDisaggregated:
+		routerRole, err := r.buildRouterRole(ctx, application)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build router role: %w", err)
+		}
+		prefillRole, err := r.buildDisaggregatedRole(application, model, "prefill")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build prefill role: %w", err)
+		}
+		decodeRole, err := r.buildDisaggregatedRole(application, model, "decode")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build decode role: %w", err)
+		}
+		roles = append(roles, routerRole, prefillRole, decodeRole)
+	default:
+		return nil, fmt.Errorf("unsupported mode: %s", getApplicationMode(application))
 	}
 
-	leaderCommand, err := generateLeaderCommand(application, model)
-	if err != nil {
-		return nil, err
-	}
-
-	workerCommand, err := generateWorkerCommand(application, model)
-	if err != nil {
-		return nil, err
-	}
-
-	rbgsReplicas := int32(application.Spec.Replicas)
-	if rbgsReplicas < 0 {
-		rbgsReplicas = 0
-	}
-	lwsSize := int32(application.Spec.Size)
-	if lwsSize < 1 {
-		lwsSize = 1
-	}
-	klog.Infof("application %s/%s (RBG): replicas %d, size: %d", application.Namespace, application.Name, rbgsReplicas, lwsSize)
-
-	volumes := []corev1.Volume{
-		{
-			Name: arksApplicationModelVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: model.Spec.Storage.PVC.Name,
-				},
-			},
-		},
-	}
-	volumes = append(volumes, application.Spec.InstanceSpec.Volumes...)
-
-	volumeMounts := []corev1.VolumeMount{
-		{
-			Name:      arksApplicationModelVolumeName,
-			MountPath: arksApplicationModelVolumeMountPath,
-			ReadOnly:  true,
-		},
-	}
-	volumeMounts = append(volumeMounts, application.Spec.InstanceSpec.VolumeMounts...)
-
-	envs := []corev1.EnvVar{}
-	envs = append(envs, application.Spec.InstanceSpec.Env...)
-	if appRuntime == string(arksv1.ArksRuntimeSGLang) {
-		envs = append(envs, corev1.EnvVar{
-			Name: "LWS_WORKER_INDEX",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{
-					FieldPath: "metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']",
-				},
-			},
-		})
-	}
-
-	// Create the base pod spec
-	podSpec := corev1.PodSpec{
-		TerminationGracePeriodSeconds: application.Spec.InstanceSpec.TerminationGracePeriodSeconds,
-		ActiveDeadlineSeconds:         application.Spec.InstanceSpec.ActiveDeadlineSeconds,
-		DNSPolicy:                     application.Spec.InstanceSpec.DNSPolicy,
-		DNSConfig:                     application.Spec.InstanceSpec.DNSConfig,
-		AutomountServiceAccountToken:  application.Spec.InstanceSpec.AutomountServiceAccountToken,
-		NodeName:                      application.Spec.InstanceSpec.NodeName,
-		HostNetwork:                   application.Spec.InstanceSpec.HostNetwork,
-		HostPID:                       application.Spec.InstanceSpec.HostPID,
-		HostIPC:                       application.Spec.InstanceSpec.HostIPC,
-		ShareProcessNamespace:         application.Spec.InstanceSpec.ShareProcessNamespace,
-		SecurityContext:               application.Spec.InstanceSpec.PodSecurityContext,
-		Subdomain:                     application.Spec.InstanceSpec.Subdomain,
-		HostAliases:                   application.Spec.InstanceSpec.HostAliases,
-		PriorityClassName:             application.Spec.InstanceSpec.PriorityClassName,
-		Priority:                      application.Spec.InstanceSpec.Priority,
-		RuntimeClassName:              application.Spec.InstanceSpec.RuntimeClassName,
-		EnableServiceLinks:            application.Spec.InstanceSpec.EnableServiceLinks,
-		PreemptionPolicy:              application.Spec.InstanceSpec.PreemptionPolicy,
-		Overhead:                      application.Spec.InstanceSpec.Overhead,
-		TopologySpreadConstraints:     application.Spec.InstanceSpec.TopologySpreadConstraints,
-		SetHostnameAsFQDN:             application.Spec.InstanceSpec.SetHostnameAsFQDN,
-		OS:                            application.Spec.InstanceSpec.OS,
-		HostUsers:                     application.Spec.InstanceSpec.HostUsers,
-		SchedulingGates:               application.Spec.InstanceSpec.SchedulingGates,
-		ResourceClaims:                application.Spec.InstanceSpec.ResourceClaims,
-		ServiceAccountName:            application.Spec.InstanceSpec.ServiceAccountName,
-		SchedulerName:                 application.Spec.InstanceSpec.SchedulerName,
-		Affinity:                      application.Spec.InstanceSpec.Affinity,
-		NodeSelector:                  application.Spec.InstanceSpec.NodeSelector,
-		Tolerations:                   application.Spec.InstanceSpec.Tolerations,
-		ImagePullSecrets:              application.Spec.RuntimeImagePullSecrets,
-		InitContainers:                application.Spec.InstanceSpec.InitContainers,
-		Volumes:                       volumes,
-		Containers: []corev1.Container{
-			{
-				Name:            "instance",
-				Image:           image,
-				Command:         leaderCommand, // Will be patched for workers
-				ImagePullPolicy: corev1.PullIfNotPresent,
-				Env:             envs,
-				Resources:       application.Spec.InstanceSpec.Resources,
-				VolumeMounts:    volumeMounts,
-				Ports: []corev1.ContainerPort{
-					{
-						ContainerPort: 8080,
-					},
-				},
-				SecurityContext: application.Spec.InstanceSpec.SecurityContext,
-				ReadinessProbe:  application.Spec.InstanceSpec.ReadinessProbe,
-				LivenessProbe:   application.Spec.InstanceSpec.LivenessProbe,
-				StartupProbe:    application.Spec.InstanceSpec.StartupProbe,
-			},
-		},
-	}
-
-	// Create worker patch
-	workerPatch := corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{}, // Include metadata to match API server default
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:      "instance",
-					Command:   workerCommand,
-					Resources: corev1.ResourceRequirements{}, // Include empty resources to match API server default
-				},
-			},
-		},
-	}
-
-	workerPatchJSON, err := json.Marshal(workerPatch)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal worker patch: %v", err)
-	}
-
-	// Create RoleBasedGroupSet
+	rbgsReplicas := int32(1)
 	rbgs := &rbgv1alpha1.RoleBasedGroupSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: application.Namespace,
 			Name:      application.Name,
 			Labels: map[string]string{
 				arksv1.ArksControllerKeyApplication: application.Name,
+				arksv1.ArksControllerKeyModel:       application.Spec.Model.Name,
 			},
 		},
 		Spec: rbgv1alpha1.RoleBasedGroupSetSpec{
 			Replicas: &rbgsReplicas,
 			Template: rbgv1alpha1.RoleBasedGroupSpec{
-				PodGroupPolicy: convertToRbgPodGroupPolicy(application.Spec.PodGroupPolicy),
-				Roles: []rbgv1alpha1.RoleSpec{
-					{
-						Name:          "inference",
-						Replicas:      ptr.To(int32(1)), // One role per group
-						RestartPolicy: rbgv1alpha1.RecreateRoleInstanceOnPodRestart,
-						Workload: rbgv1alpha1.WorkloadSpec{
-							APIVersion: "leaderworkerset.x-k8s.io/v1",
-							Kind:       "LeaderWorkerSet",
-						},
-						LeaderWorkerSet: rbgv1alpha1.LeaderWorkerTemplate{
-							Size: &lwsSize,
-							PatchWorkerTemplate: runtime.RawExtension{
-								Raw: workerPatchJSON,
-							},
-						},
-						RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
-							Type: rbgv1alpha1.RollingUpdateStrategyType,
-							RollingUpdate: &rbgv1alpha1.RollingUpdate{
-								MaxUnavailable: intstr.FromInt(1),
-								MaxSurge:       intstr.FromInt(0),
-								Partition:      ptr.To(int32(0)), // Include partition to match API server default
-							},
-						},
-						Template: corev1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Annotations: application.Spec.InstanceSpec.Annotations,
-								Labels:      generateLwsLabels(application, arksv1.ArksWorkLoadRoleLeader),
-							},
-							Spec: podSpec,
-						},
-					},
-				},
+				PodGroupPolicy: convertArksAppPodGroupPolicy(application.Spec.PodGroupPolicy),
+				Roles:          roles,
 			},
 		},
 	}
 
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated && application.Spec.CoordinationPolicy != nil {
+		rbgs.Spec.Template.CoordinationRequirements = buildCoordinationRequirements(application.Spec.CoordinationPolicy)
+	}
+
 	return rbgs, nil
+}
+
+func (r *ArksApplicationReconciler) buildUnifiedRole(application *arksv1.ArksApplication, model *arksv1.ArksModel) (rbgv1alpha1.RoleSpec, error) {
+	if application.Spec.Unified == nil {
+		return rbgv1alpha1.RoleSpec{}, fmt.Errorf("unified spec is required for unified mode")
+	}
+	unified := application.Spec.Unified
+
+	image, err := getApplicationRuntimeImage(application)
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, err
+	}
+
+	leaderCommand, err := generateLeaderCommand(application, model)
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, err
+	}
+	workerCommand, err := generateWorkerCommand(application, model)
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, err
+	}
+
+	var replicas int32
+	if unified.Replicas != nil {
+		replicas = *unified.Replicas
+	}
+	if replicas < 0 {
+		replicas = 0
+	}
+	lwsSize := int32(unified.Size)
+	if lwsSize < 1 {
+		lwsSize = 1
+	}
+
+	volumes, volumeMounts := buildModelVolumes(model, &unified.InstanceSpec)
+	envs := buildRuntimeEnvs(getArksApplicationRuntime(application), unified.InstanceSpec.Env)
+
+	// LeaderCommandOverride / WorkerCommandOverride mirror the legacy
+	// ArksDisaggregatedWorkload semantics: when set, the user-provided
+	// command replaces the generated leader/worker command, and the
+	// raw original command is exposed as ARKS_LEADER_COMMAND /
+	// ARKS_WORKER_COMMAND so the override can `eval "$ARKS_..."` or
+	// `sh -c "$ARKS_..."` without losing argument boundaries.
+	leaderEnvs := append([]corev1.EnvVar{}, envs...)
+	leaderCommands := []string{"/bin/bash", "-c", leaderCommand}
+	if len(unified.LeaderCommandOverride) > 0 {
+		leaderEnvs = append(leaderEnvs, corev1.EnvVar{Name: "ARKS_LEADER_COMMAND", Value: leaderCommand})
+		leaderCommands = unified.LeaderCommandOverride
+	}
+
+	workerEnvs := append([]corev1.EnvVar{}, envs...)
+	workerCommands := []string{"/bin/bash", "-c", workerCommand}
+	if len(unified.WorkerCommandOverride) > 0 {
+		workerEnvs = append(workerEnvs, corev1.EnvVar{Name: "ARKS_WORKER_COMMAND", Value: workerCommand})
+		workerCommands = unified.WorkerCommandOverride
+	}
+
+	podSpec := buildPodSpec(&unified.InstanceSpec, application.Spec.RuntimeImagePullSecrets, volumes, leaderEnvs, image, leaderCommands)
+	podSpec.Containers = []corev1.Container{
+		{
+			Name:            "instance",
+			Image:           image,
+			Command:         leaderCommands,
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Env:             leaderEnvs,
+			Resources:       unified.InstanceSpec.Resources,
+			VolumeMounts:    volumeMounts,
+			Ports:           []corev1.ContainerPort{{ContainerPort: 8080}},
+			SecurityContext: unified.InstanceSpec.SecurityContext,
+			ReadinessProbe:  unified.InstanceSpec.ReadinessProbe,
+			LivenessProbe:   unified.InstanceSpec.LivenessProbe,
+			StartupProbe:    unified.InstanceSpec.StartupProbe,
+		},
+	}
+
+	workerPatch, err := json.Marshal(corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: unified.InstanceSpec.Annotations,
+			Labels:      generateUnifiedLabels(application, arksv1.ArksWorkLoadRoleWorker),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:      "instance",
+					Command:   workerCommands,
+					Env:       workerEnvs,
+					Resources: corev1.ResourceRequirements{},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, fmt.Errorf("failed to marshal worker patch: %w", err)
+	}
+
+	return rbgv1alpha1.RoleSpec{
+		Name:          "unified",
+		Replicas:      ptr.To(replicas),
+		RestartPolicy: rbgv1alpha1.RecreateRoleInstanceOnPodRestart,
+		Workload: rbgv1alpha1.WorkloadSpec{
+			APIVersion: "leaderworkerset.x-k8s.io/v1",
+			Kind:       "LeaderWorkerSet",
+		},
+		LeaderWorkerSet: &rbgv1alpha1.LeaderWorkerTemplate{
+			Size: &lwsSize,
+			PatchWorkerTemplate: &runtime.RawExtension{
+				Raw: workerPatch,
+			},
+		},
+		RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
+			Type: rbgv1alpha1.RollingUpdateStrategyType,
+			RollingUpdate: &rbgv1alpha1.RollingUpdate{
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				MaxSurge:       ptr.To(intstr.FromInt(0)),
+				Partition:      ptr.To(intstr.FromInt(0)),
+			},
+		},
+		TemplateSource: rbgv1alpha1.TemplateSource{
+			Template: &corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: unified.InstanceSpec.Annotations,
+					Labels:      generateUnifiedLabels(application, arksv1.ArksWorkLoadRoleLeader),
+				},
+				Spec: podSpec,
+			},
+		},
+	}, nil
+}
+
+func (r *ArksApplicationReconciler) buildRouterRole(ctx context.Context, application *arksv1.ArksApplication) (rbgv1alpha1.RoleSpec, error) {
+	if application.Spec.Router == nil {
+		return rbgv1alpha1.RoleSpec{}, fmt.Errorf("router spec is required to build router role")
+	}
+	router := application.Spec.Router
+	serviceAccountName := router.InstanceSpec.ServiceAccountName
+	if serviceAccountName == "" {
+		var err error
+		serviceAccountName, err = r.applyRouterRBAC(ctx, application)
+		if err != nil {
+			return rbgv1alpha1.RoleSpec{}, err
+		}
+	}
+
+	port := router.Port
+	if port == 0 {
+		port = 8080
+	}
+	metricPort := router.MetricPort
+	if metricPort == 0 {
+		metricPort = 9090
+	}
+
+	image, err := r.getApplicationRouterImage(application)
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, err
+	}
+	envs := append([]corev1.EnvVar{}, router.InstanceSpec.Env...)
+	var commands []string
+	var args []string
+	// Always compute the controller-generated router command when possible;
+	// it is exposed as ARKS_ROUTER_COMMAND so a commandOverride can compose
+	// on top of the original command (mirrors the legacy PD CRD semantics).
+	generatedRouterCommand := ""
+	if getArksApplicationRuntime(application) == string(arksv1.ArksRuntimeSGLang) {
+		if c, err := r.generateRouterCommand(application, port, metricPort); err == nil {
+			generatedRouterCommand = c
+		}
+	}
+	if len(router.CommandOverride) > 0 {
+		commands = router.CommandOverride
+		// router.RouterArgs is passed as Container.Args so a binary-style
+		// commandOverride (e.g. ["python3", "-m", "my_router"]) can receive
+		// CLI flags via routerArgs. With shell-style commandOverride
+		// (e.g. ["/bin/sh", "-c", "script"]) routerArgs become shell
+		// positional parameters; users who don't want that should leave
+		// routerArgs empty and put their flags inside the script.
+		if len(router.RouterArgs) > 0 {
+			args = append(args, router.RouterArgs...)
+		}
+		if generatedRouterCommand != "" {
+			envs = append(envs, corev1.EnvVar{Name: "ARKS_ROUTER_COMMAND", Value: generatedRouterCommand})
+		}
+	} else {
+		if generatedRouterCommand == "" {
+			// non-sglang without commandOverride is already rejected by
+			// validate(); reach here only when generateRouterCommand failed.
+			command, err := r.generateRouterCommand(application, port, metricPort)
+			if err != nil {
+				return rbgv1alpha1.RoleSpec{}, err
+			}
+			generatedRouterCommand = command
+		}
+		// The default sglang router path already appended router.RouterArgs
+		// inside generateRouterCommand, so we deliberately leave args nil
+		// to avoid double-passing them.
+		commands = []string{"/bin/bash", "-c", generatedRouterCommand}
+	}
+
+	replicas := int32(1)
+	if router.Replicas != nil && *router.Replicas >= 0 {
+		replicas = *router.Replicas
+	}
+
+	probePort := port
+	readinessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/readiness",
+				Port: intstr.FromInt(int(probePort)),
+			},
+		},
+		InitialDelaySeconds: 30,
+		PeriodSeconds:       10,
+		TimeoutSeconds:      3,
+		FailureThreshold:    120,
+	}
+	if router.InstanceSpec.ReadinessProbe != nil {
+		readinessProbe = router.InstanceSpec.ReadinessProbe
+	}
+
+	instance := &router.InstanceSpec
+	podSpec := corev1.PodSpec{
+		TerminationGracePeriodSeconds: instance.TerminationGracePeriodSeconds,
+		ActiveDeadlineSeconds:         instance.ActiveDeadlineSeconds,
+		DNSPolicy:                     instance.DNSPolicy,
+		DNSConfig:                     instance.DNSConfig,
+		AutomountServiceAccountToken:  instance.AutomountServiceAccountToken,
+		NodeName:                      instance.NodeName,
+		HostNetwork:                   instance.HostNetwork,
+		HostPID:                       instance.HostPID,
+		HostIPC:                       instance.HostIPC,
+		ShareProcessNamespace:         instance.ShareProcessNamespace,
+		SecurityContext:               instance.PodSecurityContext,
+		Subdomain:                     instance.Subdomain,
+		HostAliases:                   instance.HostAliases,
+		PriorityClassName:             instance.PriorityClassName,
+		Priority:                      instance.Priority,
+		RuntimeClassName:              instance.RuntimeClassName,
+		EnableServiceLinks:            instance.EnableServiceLinks,
+		PreemptionPolicy:              instance.PreemptionPolicy,
+		Overhead:                      instance.Overhead,
+		TopologySpreadConstraints:     instance.TopologySpreadConstraints,
+		SetHostnameAsFQDN:             instance.SetHostnameAsFQDN,
+		OS:                            instance.OS,
+		HostUsers:                     instance.HostUsers,
+		SchedulingGates:               instance.SchedulingGates,
+		ResourceClaims:                instance.ResourceClaims,
+		ServiceAccountName:            serviceAccountName,
+		SchedulerName:                 instance.SchedulerName,
+		Affinity:                      instance.Affinity,
+		NodeSelector:                  instance.NodeSelector,
+		Tolerations:                   instance.Tolerations,
+		ImagePullSecrets:              application.Spec.RuntimeImagePullSecrets,
+		InitContainers:                instance.InitContainers,
+		Volumes:                       instance.Volumes,
+		Containers: []corev1.Container{
+			{
+				Name:            "main",
+				Image:           image,
+				Command:         commands,
+				Args:            args,
+				Resources:       instance.Resources,
+				SecurityContext: instance.SecurityContext,
+				ReadinessProbe:  readinessProbe,
+				LivenessProbe:   instance.LivenessProbe,
+				StartupProbe:    instance.StartupProbe,
+				Env:             envs,
+				Ports:           []corev1.ContainerPort{{ContainerPort: port}},
+				VolumeMounts:    instance.VolumeMounts,
+			},
+		},
+	}
+
+	return rbgv1alpha1.RoleSpec{
+		Name:          "router",
+		Replicas:      ptr.To(replicas),
+		RestartPolicy: rbgv1alpha1.RecreateRoleInstanceOnPodRestart,
+		Workload: rbgv1alpha1.WorkloadSpec{
+			APIVersion: "apps/v1",
+			Kind:       "Deployment",
+		},
+		RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
+			Type: rbgv1alpha1.RollingUpdateStrategyType,
+			RollingUpdate: &rbgv1alpha1.RollingUpdate{
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				MaxSurge:       ptr.To(intstr.FromInt(0)),
+				Partition:      ptr.To(intstr.FromInt(0)),
+			},
+		},
+		TemplateSource: rbgv1alpha1.TemplateSource{
+			Template: &corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: instance.Annotations,
+					Labels:      generateRouterLabels(application),
+				},
+				Spec: podSpec,
+			},
+		},
+	}, nil
+}
+
+func (r *ArksApplicationReconciler) buildDisaggregatedRole(application *arksv1.ArksApplication, model *arksv1.ArksModel, roleName string) (rbgv1alpha1.RoleSpec, error) {
+	image, err := getApplicationRuntimeImage(application)
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, err
+	}
+
+	workload := application.Spec.Prefill
+	labelsFn := generatePrefillLabels
+	if roleName == "decode" {
+		workload = application.Spec.Decode
+		labelsFn = generateDecodeLabels
+	}
+	if workload == nil {
+		return rbgv1alpha1.RoleSpec{}, fmt.Errorf("%s workload is required", roleName)
+	}
+
+	leaderCommand, err := r.generateDisaggregationLeaderCommand(application, model, roleName)
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, err
+	}
+	workerCommand, err := r.generateDisaggregationWorkerCommand(application, model, roleName)
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, err
+	}
+
+	size := workload.Size
+	if size < 1 {
+		size = 1
+	}
+	replicas := normalizeReplica(workload.Replicas, 1)
+
+	volumes, volumeMounts := buildModelVolumes(model, &workload.InstanceSpec)
+	envs := buildRuntimeEnvs(getArksApplicationRuntime(application), workload.InstanceSpec.Env)
+
+	leaderEnvs := append([]corev1.EnvVar{}, envs...)
+	leaderCommands := []string{"/bin/bash", "-c", leaderCommand}
+	if len(workload.LeaderCommandOverride) > 0 {
+		leaderEnvs = append(leaderEnvs, corev1.EnvVar{Name: "ARKS_LEADER_COMMAND", Value: leaderCommand})
+		leaderCommands = workload.LeaderCommandOverride
+	}
+
+	workerEnvs := append([]corev1.EnvVar{}, envs...)
+	workerCommands := []string{"/bin/bash", "-c", workerCommand}
+	if len(workload.WorkerCommandOverride) > 0 {
+		workerEnvs = append(workerEnvs, corev1.EnvVar{Name: "ARKS_WORKER_COMMAND", Value: workerCommand})
+		workerCommands = workload.WorkerCommandOverride
+	}
+
+	podSpec := buildPodSpec(&workload.InstanceSpec, application.Spec.RuntimeImagePullSecrets, volumes, workerEnvs, image, workerCommands)
+	podSpec.Containers = []corev1.Container{
+		{
+			Name:            "main",
+			Image:           image,
+			Command:         workerCommands,
+			Resources:       workload.InstanceSpec.Resources,
+			VolumeMounts:    volumeMounts,
+			Env:             workerEnvs,
+			SecurityContext: workload.InstanceSpec.SecurityContext,
+		},
+	}
+
+	leaderPatch, err := json.Marshal(corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: workload.InstanceSpec.Annotations,
+			Labels:      labelsFn(application, arksv1.ArksWorkLoadRoleLeader),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:           "main",
+					Command:        leaderCommands,
+					Env:            leaderEnvs,
+					ReadinessProbe: workload.InstanceSpec.ReadinessProbe,
+					LivenessProbe:  workload.InstanceSpec.LivenessProbe,
+					StartupProbe:   workload.InstanceSpec.StartupProbe,
+					Ports:          []corev1.ContainerPort{{ContainerPort: 8080}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return rbgv1alpha1.RoleSpec{}, fmt.Errorf("failed to marshal leader patch: %w", err)
+	}
+
+	return rbgv1alpha1.RoleSpec{
+		Name:          roleName,
+		Replicas:      ptr.To(replicas),
+		RestartPolicy: rbgv1alpha1.RecreateRoleInstanceOnPodRestart,
+		Workload: rbgv1alpha1.WorkloadSpec{
+			APIVersion: "leaderworkerset.x-k8s.io/v1",
+			Kind:       "LeaderWorkerSet",
+		},
+		LeaderWorkerSet: &rbgv1alpha1.LeaderWorkerTemplate{
+			Size: ptr.To(int32(size)),
+			PatchLeaderTemplate: &runtime.RawExtension{
+				Raw: leaderPatch,
+			},
+		},
+		RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
+			Type: rbgv1alpha1.RollingUpdateStrategyType,
+			RollingUpdate: &rbgv1alpha1.RollingUpdate{
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				MaxSurge:       ptr.To(intstr.FromInt(0)),
+				Partition:      ptr.To(intstr.FromInt(0)),
+			},
+		},
+		TemplateSource: rbgv1alpha1.TemplateSource{
+			Template: &corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: workload.InstanceSpec.Annotations,
+					Labels:      labelsFn(application, arksv1.ArksWorkLoadRoleWorker),
+				},
+				Spec: podSpec,
+			},
+		},
+	}, nil
+}
+
+func (r *ArksApplicationReconciler) reconcileApplicationService(ctx context.Context, application *arksv1.ArksApplication) (ctrl.Result, error) {
+	desiredTarget := r.desiredTrafficTarget(application)
+
+	if application.Status.TrafficTarget == "" {
+		if desiredTarget == arksv1.ArksApplicationTrafficTargetEngine {
+			application.Status.TrafficTarget = arksv1.ArksApplicationTrafficTargetEngine
+		} else {
+			application.Status.TrafficTarget = arksv1.ArksApplicationTrafficTargetPending
+		}
+	}
+
+	modeChanged := application.Status.Mode != "" && application.Status.Mode != getApplicationMode(application)
+	if modeChanged {
+		application.Status.TrafficTarget = arksv1.ArksApplicationTrafficTargetPending
+		updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionFalse, "ModeSwitching", "Mode is being switched, service will be interrupted")
+	}
+
+	currentTarget := application.Status.TrafficTarget
+	switch {
+	case currentTarget == arksv1.ArksApplicationTrafficTargetPending:
+		if r.isTrafficTargetReady(application, desiredTarget) {
+			if err := r.ensureApplicationService(ctx, application, desiredTarget); err != nil {
+				return ctrl.Result{}, err
+			}
+			application.Status.TrafficTarget = desiredTarget
+			application.Status.Mode = getApplicationMode(application)
+			updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionTrue, "TargetReady", "Traffic is routed to the ready target")
+			return ctrl.Result{}, nil
+		}
+		updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionFalse, "WaitingForTarget", "Waiting for target component to become ready")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+	case currentTarget == arksv1.ArksApplicationTrafficTargetEngine && desiredTarget == arksv1.ArksApplicationTrafficTargetRouter:
+		if r.isTrafficTargetReady(application, arksv1.ArksApplicationTrafficTargetRouter) {
+			if err := r.ensureApplicationService(ctx, application, arksv1.ArksApplicationTrafficTargetRouter); err != nil {
+				return ctrl.Result{}, err
+			}
+			application.Status.TrafficTarget = arksv1.ArksApplicationTrafficTargetRouter
+			updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionTrue, "RouterReady", "Traffic switched to router")
+			return ctrl.Result{}, nil
+		}
+		updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionFalse, "RouterStarting", "Waiting for router to become ready")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+	case currentTarget == arksv1.ArksApplicationTrafficTargetRouter && desiredTarget == arksv1.ArksApplicationTrafficTargetEngine:
+		if !r.isTrafficTargetReady(application, arksv1.ArksApplicationTrafficTargetEngine) {
+			updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionFalse, "EngineNotReady", "Waiting for engine to become ready")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if err := r.ensureApplicationService(ctx, application, arksv1.ArksApplicationTrafficTargetEngine); err != nil {
+			return ctrl.Result{}, err
+		}
+		application.Status.TrafficTarget = arksv1.ArksApplicationTrafficTargetEngine
+		updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionTrue, "EngineReady", "Traffic switched to engine")
+		return ctrl.Result{Requeue: true}, nil
+
+	default:
+		if err := r.ensureApplicationService(ctx, application, currentTarget); err != nil {
+			return ctrl.Result{}, err
+		}
+		if currentTarget == desiredTarget && r.isTrafficTargetReady(application, currentTarget) {
+			updateApplicationCondition(application, arksv1.ArksApplicationTrafficTargetReady, corev1.ConditionTrue, "Stable", "Traffic target is stable")
+			if !modeChanged {
+				application.Status.Mode = getApplicationMode(application)
+			}
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *ArksApplicationReconciler) desiredTrafficTarget(application *arksv1.ArksApplication) arksv1.ArksApplicationTrafficTarget {
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated || isApplicationRouterRequested(application) {
+		return arksv1.ArksApplicationTrafficTargetRouter
+	}
+	return arksv1.ArksApplicationTrafficTargetEngine
+}
+
+func (r *ArksApplicationReconciler) shouldRenderRouterRole(application *arksv1.ArksApplication) bool {
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated {
+		return true
+	}
+	// In unified mode the router role is rendered iff the user requested it
+	// (spec.router != nil). When the user removes spec.router, the role must
+	// be dropped immediately on the next reconcile; the controller still
+	// switches Service traffic from router to the engine pods through the
+	// TrafficTarget state machine. A brief endpoints gap is possible while
+	// the router Deployment terminates in parallel with the Service selector
+	// switch, but the engine pods are already running so most traffic
+	// continues uninterrupted via the in-cluster proxy's endpoint update.
+	return isApplicationRouterRequested(application)
+}
+
+func (r *ArksApplicationReconciler) isTrafficTargetReady(application *arksv1.ArksApplication, target arksv1.ArksApplicationTrafficTarget) bool {
+	switch target {
+	case arksv1.ArksApplicationTrafficTargetEngine:
+		return application.Status.Unified.Replicas > 0 &&
+			application.Status.Unified.ReadyReplicas == application.Status.Unified.Replicas
+	case arksv1.ArksApplicationTrafficTargetRouter:
+		if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated {
+			return application.Status.Router.ReadyReplicas > 0 &&
+				application.Status.Prefill.Replicas > 0 &&
+				application.Status.Prefill.ReadyReplicas == application.Status.Prefill.Replicas &&
+				application.Status.Decode.Replicas > 0 &&
+				application.Status.Decode.ReadyReplicas == application.Status.Decode.Replicas
+		}
+		return application.Status.Router.ReadyReplicas > 0 &&
+			application.Status.Unified.Replicas > 0 &&
+			application.Status.Unified.ReadyReplicas == application.Status.Unified.Replicas
+	default:
+		return false
+	}
+}
+
+func (r *ArksApplicationReconciler) ensureApplicationService(ctx context.Context, application *arksv1.ArksApplication, target arksv1.ArksApplicationTrafficTarget) error {
+	serviceName := generateApplicationServiceName(application)
+	selector := applicationUnifiedSelector(application)
+	port := int32(8080)
+	targetPort := intstr.FromInt(8080)
+	if target == arksv1.ArksApplicationTrafficTargetRouter {
+		selector = applicationRouterSelector(application)
+		if application.Spec.Router != nil && application.Spec.Router.Port != 0 {
+			targetPort = intstr.FromInt(int(application.Spec.Router.Port))
+		}
+	}
+
+	service := &corev1.Service{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: application.Namespace}, service); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to query service: %w", err)
+		}
+		service = &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: application.Namespace,
+				Name:      serviceName,
+				Labels: map[string]string{
+					"prometheus-discovery": "true",
+					"managed-by":           "arks",
+				},
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: selector,
+				Ports: []corev1.ServicePort{
+					{
+						Name:       "http",
+						Port:       port,
+						TargetPort: targetPort,
+						Protocol:   corev1.ProtocolTCP,
+					},
+				},
+			},
+		}
+		if err := ctrl.SetControllerReference(application, service, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.Client.Create(ctx, service); err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create service: %w", err)
+		}
+		return nil
+	}
+
+	needsUpdate := !apiequality.Semantic.DeepEqual(service.Spec.Selector, selector) ||
+		len(service.Spec.Ports) != 1 ||
+		service.Spec.Ports[0].Port != port ||
+		service.Spec.Ports[0].TargetPort != targetPort
+	if !needsUpdate {
+		return nil
+	}
+
+	patch := client.MergeFrom(service.DeepCopy())
+	service.Spec.Selector = selector
+	service.Spec.Ports = []corev1.ServicePort{
+		{
+			Name:       "http",
+			Port:       port,
+			TargetPort: targetPort,
+			Protocol:   corev1.ProtocolTCP,
+		},
+	}
+	if err := r.Client.Patch(ctx, service, patch); err != nil {
+		return fmt.Errorf("failed to patch service: %w", err)
+	}
+	return nil
+}
+
+func (r *ArksApplicationReconciler) syncApplicationStatus(ctx context.Context, application *arksv1.ArksApplication) error {
+	application.Status.Unified = arksv1.ArksRoleStatus{}
+	application.Status.Router = arksv1.ArksRoleStatus{}
+	application.Status.Prefill = arksv1.ArksRoleStatus{}
+	application.Status.Decode = arksv1.ArksRoleStatus{}
+	application.Status.Replicas = 0
+	application.Status.ReadyReplicas = 0
+	application.Status.UpdatedReplicas = 0
+
+	rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: application.Name, Namespace: application.Namespace}, rbgs); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to query RBGS status: %w", err)
+	}
+
+	rbgList := &rbgv1alpha1.RoleBasedGroupList{}
+	if err := r.Client.List(ctx, rbgList, client.InNamespace(application.Namespace)); err != nil {
+		return fmt.Errorf("failed to list RBGs: %w", err)
+	}
+
+	var rbg *rbgv1alpha1.RoleBasedGroup
+	for i := range rbgList.Items {
+		if owner := metav1.GetControllerOf(&rbgList.Items[i]); owner != nil && owner.Kind == "RoleBasedGroupSet" && owner.Name == rbgs.Name {
+			rbg = &rbgList.Items[i]
+			break
+		}
+	}
+	if rbg == nil {
+		return nil
+	}
+
+	for _, roleStatus := range rbg.Status.RoleStatuses {
+		switch roleStatus.Name {
+		case "unified":
+			application.Status.Unified.Replicas = roleStatus.Replicas
+			application.Status.Unified.ReadyReplicas = roleStatus.ReadyReplicas
+			if lws, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, fmt.Sprintf("%s-unified", rbg.Name), metav1.GetOptions{}); err == nil {
+				application.Status.Unified.UpdatedReplicas = lws.Status.UpdatedReplicas
+			}
+		case "router":
+			application.Status.Router.Replicas = roleStatus.Replicas
+			application.Status.Router.ReadyReplicas = roleStatus.ReadyReplicas
+			if deploy, err := r.KubeClient.AppsV1().Deployments(application.Namespace).Get(ctx, fmt.Sprintf("%s-router", rbg.Name), metav1.GetOptions{}); err == nil {
+				application.Status.Router.UpdatedReplicas = deploy.Status.UpdatedReplicas
+			}
+		case "prefill":
+			application.Status.Prefill.Replicas = roleStatus.Replicas
+			application.Status.Prefill.ReadyReplicas = roleStatus.ReadyReplicas
+			if lws, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, fmt.Sprintf("%s-prefill", rbg.Name), metav1.GetOptions{}); err == nil {
+				application.Status.Prefill.UpdatedReplicas = lws.Status.UpdatedReplicas
+			}
+		case "decode":
+			application.Status.Decode.Replicas = roleStatus.Replicas
+			application.Status.Decode.ReadyReplicas = roleStatus.ReadyReplicas
+			if lws, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(application.Namespace).Get(ctx, fmt.Sprintf("%s-decode", rbg.Name), metav1.GetOptions{}); err == nil {
+				application.Status.Decode.UpdatedReplicas = lws.Status.UpdatedReplicas
+			}
+		}
+	}
+
+	syncApplicationAggregateStatus(application)
+	return nil
+}
+
+func syncApplicationAggregateStatus(application *arksv1.ArksApplication) {
+	switch getApplicationMode(application) {
+	case arksv1.ArksApplicationModeDisaggregated:
+		application.Status.Replicas =
+			application.Status.Router.Replicas +
+				application.Status.Prefill.Replicas +
+				application.Status.Decode.Replicas
+		application.Status.ReadyReplicas =
+			application.Status.Router.ReadyReplicas +
+				application.Status.Prefill.ReadyReplicas +
+				application.Status.Decode.ReadyReplicas
+		application.Status.UpdatedReplicas =
+			application.Status.Router.UpdatedReplicas +
+				application.Status.Prefill.UpdatedReplicas +
+				application.Status.Decode.UpdatedReplicas
+	default:
+		application.Status.Replicas = application.Status.Unified.Replicas
+		application.Status.ReadyReplicas = application.Status.Unified.ReadyReplicas
+		application.Status.UpdatedReplicas = application.Status.Unified.UpdatedReplicas
+	}
+}
+
+func (r *ArksApplicationReconciler) updateApplicationPhase(application *arksv1.ArksApplication) {
+	if isArksAppReady(application) {
+		application.Status.Phase = string(arksv1.ArksApplicationPhaseRunning)
+		application.Status.Mode = getApplicationMode(application)
+		updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionTrue, "Running", "The LLM service is running")
+		return
+	}
+
+	if application.Status.Phase != string(arksv1.ArksApplicationPhaseFailed) {
+		application.Status.Phase = string(arksv1.ArksApplicationPhaseCreating)
+	}
+	updateApplicationCondition(application, arksv1.ArksApplicationReady, corev1.ConditionFalse, "WaitingForReady", "Waiting for all active components to become ready")
+}
+
+func buildModelVolumes(model *arksv1.ArksModel, instanceSpec *arksv1.ArksInstanceSpec) ([]corev1.Volume, []corev1.VolumeMount) {
+	volumes := []corev1.Volume{
+		{
+			Name: arksApplicationModelVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: model.Spec.Storage.PVC.Name,
+				},
+			},
+		},
+	}
+	volumes = append(volumes, instanceSpec.Volumes...)
+
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      arksApplicationModelVolumeName,
+			MountPath: arksApplicationModelVolumeMountPath,
+			ReadOnly:  true,
+		},
+	}
+	volumeMounts = append(volumeMounts, instanceSpec.VolumeMounts...)
+	return volumes, volumeMounts
+}
+
+func buildRuntimeEnvs(runtime string, envs []corev1.EnvVar) []corev1.EnvVar {
+	result := append([]corev1.EnvVar{}, envs...)
+	if runtime == string(arksv1.ArksRuntimeSGLang) {
+		result = append(result, corev1.EnvVar{
+			Name: "LWS_WORKER_INDEX",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']",
+				},
+			},
+		})
+	}
+	return result
+}
+
+func buildPodSpec(instanceSpec *arksv1.ArksInstanceSpec, imagePullSecrets []corev1.LocalObjectReference, volumes []corev1.Volume, envs []corev1.EnvVar, image string, command []string) corev1.PodSpec {
+	return corev1.PodSpec{
+		TerminationGracePeriodSeconds: instanceSpec.TerminationGracePeriodSeconds,
+		ActiveDeadlineSeconds:         instanceSpec.ActiveDeadlineSeconds,
+		DNSPolicy:                     instanceSpec.DNSPolicy,
+		DNSConfig:                     instanceSpec.DNSConfig,
+		AutomountServiceAccountToken:  instanceSpec.AutomountServiceAccountToken,
+		NodeName:                      instanceSpec.NodeName,
+		HostNetwork:                   instanceSpec.HostNetwork,
+		HostPID:                       instanceSpec.HostPID,
+		HostIPC:                       instanceSpec.HostIPC,
+		ShareProcessNamespace:         instanceSpec.ShareProcessNamespace,
+		SecurityContext:               instanceSpec.PodSecurityContext,
+		Subdomain:                     instanceSpec.Subdomain,
+		HostAliases:                   instanceSpec.HostAliases,
+		PriorityClassName:             instanceSpec.PriorityClassName,
+		Priority:                      instanceSpec.Priority,
+		RuntimeClassName:              instanceSpec.RuntimeClassName,
+		EnableServiceLinks:            instanceSpec.EnableServiceLinks,
+		PreemptionPolicy:              instanceSpec.PreemptionPolicy,
+		Overhead:                      instanceSpec.Overhead,
+		TopologySpreadConstraints:     instanceSpec.TopologySpreadConstraints,
+		SetHostnameAsFQDN:             instanceSpec.SetHostnameAsFQDN,
+		OS:                            instanceSpec.OS,
+		HostUsers:                     instanceSpec.HostUsers,
+		SchedulingGates:               instanceSpec.SchedulingGates,
+		ResourceClaims:                instanceSpec.ResourceClaims,
+		ServiceAccountName:            instanceSpec.ServiceAccountName,
+		SchedulerName:                 instanceSpec.SchedulerName,
+		Affinity:                      instanceSpec.Affinity,
+		NodeSelector:                  instanceSpec.NodeSelector,
+		Tolerations:                   instanceSpec.Tolerations,
+		ImagePullSecrets:              imagePullSecrets,
+		InitContainers:                instanceSpec.InitContainers,
+		Volumes:                       volumes,
+		Containers: []corev1.Container{
+			{
+				Name:            "main",
+				Image:           image,
+				Command:         command,
+				Resources:       instanceSpec.Resources,
+				VolumeMounts:    []corev1.VolumeMount{},
+				Env:             envs,
+				SecurityContext: instanceSpec.SecurityContext,
+				ReadinessProbe:  instanceSpec.ReadinessProbe,
+				LivenessProbe:   instanceSpec.LivenessProbe,
+				StartupProbe:    instanceSpec.StartupProbe,
+			},
+		},
+	}
 }
 
 func generateApplicationServiceName(application *arksv1.ArksApplication) string {
 	return fmt.Sprintf("arks-application-%s", application.Name)
 }
 
-func generateLwsLabels(application *arksv1.ArksApplication, role string) map[string]string {
-	podLabels := map[string]string{}
-	for key, value := range application.Spec.InstanceSpec.Labels {
-		podLabels[key] = value
+func applicationUnifiedSelector(application *arksv1.ArksApplication) map[string]string {
+	return map[string]string{
+		arksv1.ArksControllerKeyApplication:  application.Name,
+		arksv1.ArksControllerKeyRole:         "unified",
+		arksv1.ArksControllerKeyWorkLoadRole: arksv1.ArksWorkLoadRoleLeader,
 	}
-	podLabels[arksv1.ArksControllerKeyApplication] = application.Name
-	podLabels[arksv1.ArksControllerKeyModel] = application.Spec.Model.Name
-	podLabels[arksv1.ArksControllerKeyWorkLoadRole] = role
+}
 
-	return podLabels
+func applicationRouterSelector(application *arksv1.ArksApplication) map[string]string {
+	return map[string]string{
+		arksv1.ArksControllerKeyApplication: application.Name,
+		arksv1.ArksControllerKeyRole:        "router",
+	}
+}
+
+func generateUnifiedLabels(application *arksv1.ArksApplication, role string) map[string]string {
+	labels := map[string]string{}
+	if application.Spec.Unified != nil {
+		for key, value := range application.Spec.Unified.InstanceSpec.Labels {
+			labels[key] = value
+		}
+	}
+	labels[arksv1.ArksControllerKeyApplication] = application.Name
+	labels[arksv1.ArksControllerKeyModel] = application.Spec.Model.Name
+	labels[arksv1.ArksControllerKeyRole] = "unified"
+	labels[arksv1.ArksControllerKeyWorkLoadRole] = role
+	return labels
+}
+
+func generateRouterLabels(application *arksv1.ArksApplication) map[string]string {
+	labels := map[string]string{}
+	if application.Spec.Router != nil {
+		for key, value := range application.Spec.Router.InstanceSpec.Labels {
+			labels[key] = value
+		}
+	}
+	labels[arksv1.ArksControllerKeyApplication] = application.Name
+	labels[arksv1.ArksControllerKeyModel] = application.Spec.Model.Name
+	labels[arksv1.ArksControllerKeyRole] = "router"
+	labels[arksv1.ArksControllerKeySglangRouter] = "true"
+	return labels
+}
+
+func generatePrefillLabels(application *arksv1.ArksApplication, role string) map[string]string {
+	labels := map[string]string{}
+	if application.Spec.Prefill != nil {
+		for key, value := range application.Spec.Prefill.InstanceSpec.Labels {
+			labels[key] = value
+		}
+	}
+	labels[arksv1.ArksControllerKeyApplication] = application.Name
+	labels[arksv1.ArksControllerKeyModel] = application.Spec.Model.Name
+	labels[arksv1.ArksControllerKeyRole] = "prefill"
+	labels[arksv1.ArksControllerKeyWorkLoadRole] = role
+	return labels
+}
+
+func generateDecodeLabels(application *arksv1.ArksApplication, role string) map[string]string {
+	labels := map[string]string{}
+	if application.Spec.Decode != nil {
+		for key, value := range application.Spec.Decode.InstanceSpec.Labels {
+			labels[key] = value
+		}
+	}
+	labels[arksv1.ArksControllerKeyApplication] = application.Name
+	labels[arksv1.ArksControllerKeyModel] = application.Spec.Model.Name
+	labels[arksv1.ArksControllerKeyRole] = "decode"
+	labels[arksv1.ArksControllerKeyWorkLoadRole] = role
+	return labels
+}
+
+func (r *ArksApplicationReconciler) applyRouterRBAC(ctx context.Context, application *arksv1.ArksApplication) (string, error) {
+	rbacName := fmt.Sprintf("%s-sglang-router", application.Name)
+
+	if _, err := r.KubeClient.RbacV1().RoleBindings(application.Namespace).Get(ctx, rbacName, metav1.GetOptions{}); err == nil {
+		return rbacName, nil
+	}
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: application.Namespace,
+			Name:      rbacName,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(application, arksv1.GroupVersion.WithKind("ArksApplication")),
+			},
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				Verbs:     []string{"get", "list", "watch"},
+				Resources: []string{"pods"},
+				APIGroups: []string{""},
+			},
+		},
+	}
+	if _, err := r.KubeClient.RbacV1().Roles(application.Namespace).Create(ctx, role, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("failed to create router role: %w", err)
+	}
+
+	serviceAccount := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: application.Namespace,
+			Name:      rbacName,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(application, arksv1.GroupVersion.WithKind("ArksApplication")),
+			},
+		},
+	}
+	if _, err := r.KubeClient.CoreV1().ServiceAccounts(application.Namespace).Create(ctx, serviceAccount, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("failed to create router service account: %w", err)
+	}
+
+	roleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: application.Namespace,
+			Name:      rbacName,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(application, arksv1.GroupVersion.WithKind("ArksApplication")),
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      rbacName,
+				Namespace: application.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			Kind:     "Role",
+			Name:     rbacName,
+			APIGroup: "rbac.authorization.k8s.io",
+		},
+	}
+	if _, err := r.KubeClient.RbacV1().RoleBindings(application.Namespace).Create(ctx, roleBinding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("failed to create router role binding: %w", err)
+	}
+
+	return rbacName, nil
+}
+
+func (r *ArksApplicationReconciler) getApplicationRouterImage(application *arksv1.ArksApplication) (string, error) {
+	if application.Spec.RouterImage != "" {
+		return application.Spec.RouterImage, nil
+	}
+
+	switch getArksApplicationRuntime(application) {
+	case string(arksv1.ArksRuntimeSGLang):
+		if image := os.Getenv("ARKS_DEFAULT_SGLANG_ROUTER_IMAGE"); image != "" {
+			return image, nil
+		}
+		if image := os.Getenv("ARKS_DEFAULT_SGLANG_IMAGE"); image != "" {
+			return image, nil
+		}
+		return "lmsysorg/sglang:v0.5.1.post1-cu126", nil
+	default:
+		return "", errors.New("router is only supported with runtime=sglang")
+	}
 }
 
 func getApplicationRuntimeImage(application *arksv1.ArksApplication) (string, error) {
-	// Make sure the Runtime match with the RuntimeImage.
 	if application.Spec.RuntimeImage != "" {
 		return application.Spec.RuntimeImage, nil
 	}
 
-	appRuntime := getStandaloneApplicationRuntime(application)
-
-	switch appRuntime {
+	switch getArksApplicationRuntime(application) {
 	case string(arksv1.ArksRuntimeVLLM):
-		vllmImage := os.Getenv("ARKS_RUNTIME_DEFAULT_VLLM_IMAGE")
-		if vllmImage != "" {
-			return vllmImage, nil
+		if image := os.Getenv("ARKS_RUNTIME_DEFAULT_VLLM_IMAGE"); image != "" {
+			return image, nil
 		}
 		return "vllm/vllm-openai:v0.8.2", nil
 	case string(arksv1.ArksRuntimeSGLang):
-		sglangImage := os.Getenv("ARKS_RUNTIME_DEFAULT_SGLANG_IMAGE")
-		if sglangImage != "" {
-			return sglangImage, nil
+		if image := os.Getenv("ARKS_RUNTIME_DEFAULT_SGLANG_IMAGE"); image != "" {
+			return image, nil
 		}
 		return "lmsysorg/sglang:v0.4.5-cu124", nil
 	case string(arksv1.ArksRuntimeDynamo):
-		dynamoImage := os.Getenv("ARKS_RUNTIME_DEFAULT_DYNAMO_IMAGE")
-		if dynamoImage != "" {
-			return dynamoImage, nil
+		if image := os.Getenv("ARKS_RUNTIME_DEFAULT_DYNAMO_IMAGE"); image != "" {
+			return image, nil
 		}
 		return "scitixai/k8s/dynamo:vllm", nil
-		// return "docker.io/scitixai/dynamo:vllm", nil
 	default:
-		// never reach here
 		return "", fmt.Errorf("runtime not support")
 	}
 }
 
-func generateLeaderCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) ([]string, error) {
-	appRuntime := getStandaloneApplicationRuntime(application)
+func unifiedRuntimeCommonArgs(application *arksv1.ArksApplication) []string {
+	if application.Spec.Unified == nil {
+		return nil
+	}
+	return application.Spec.Unified.RuntimeCommonArgs
+}
 
-	switch appRuntime {
+// generateLeaderCommand returns the raw leader command string. Callers wrap
+// it with `/bin/bash -c` when assigning to Container.Command, and inject
+// the same raw string into ARKS_LEADER_COMMAND so override scripts can
+// `eval "$ARKS_LEADER_COMMAND"` without double-shell quoting issues.
+func generateLeaderCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) (string, error) {
+	switch getArksApplicationRuntime(application) {
 	case string(arksv1.ArksRuntimeVLLM):
 		args := "/bin/bash /vllm-workspace/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=$(LWS_GROUP_SIZE); python3 -m vllm.entrypoints.openai.api_server --port 8080"
 		args = fmt.Sprintf("%s --model %s", args, generateModelPath(model))
 		args = fmt.Sprintf("%s --served-model-name %s", args, getServedModelName(application))
-		if application.Spec.TensorParallelSize > 0 {
-			args = fmt.Sprintf("%s --tensor-parallel-size %d", args, application.Spec.TensorParallelSize)
+		for _, arg := range unifiedRuntimeCommonArgs(application) {
+			args = fmt.Sprintf("%s %s", args, arg)
 		}
-		for i := range application.Spec.RuntimeCommonArgs {
-			args = fmt.Sprintf("%s %s", args, application.Spec.RuntimeCommonArgs[i])
-		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	case string(arksv1.ArksRuntimeSGLang):
 		args := "python3 -m sglang.launch_server --dist-init-addr $(LWS_LEADER_ADDRESS):20000 --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) --trust-remote-code --host 0.0.0.0 --port 8080"
 		args = fmt.Sprintf("%s --model-path %s", args, generateModelPath(model))
 		args = fmt.Sprintf("%s --served-model-name %s", args, getServedModelName(application))
-		if application.Spec.TensorParallelSize > 0 {
-			args = fmt.Sprintf("%s --tp %d", args, application.Spec.TensorParallelSize)
-		}
-		for i := range application.Spec.RuntimeCommonArgs {
-			args = fmt.Sprintf("%s %s", args, application.Spec.RuntimeCommonArgs[i])
+		for _, arg := range unifiedRuntimeCommonArgs(application) {
+			args = fmt.Sprintf("%s %s", args, arg)
 		}
 		if !strings.Contains(args, "enable-metrics") {
 			args = fmt.Sprintf("%s --enable-metrics", args)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	case string(arksv1.ArksRuntimeDynamo):
 		args := "dynamo run in=http out=dyn://$(LWS_LEADER_ADDRESS)"
-		for i := range application.Spec.RuntimeCommonArgs {
-			args = fmt.Sprintf("%s %s", args, application.Spec.RuntimeCommonArgs[i])
+		for _, arg := range unifiedRuntimeCommonArgs(application) {
+			args = fmt.Sprintf("%s %s", args, arg)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	default:
-		// never reach here
-		return nil, fmt.Errorf("runtime not support")
+		return "", fmt.Errorf("runtime not support")
 	}
 }
 
-func generateWorkerCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) ([]string, error) {
-	appRuntime := getStandaloneApplicationRuntime(application)
-
-	switch appRuntime {
+// generateWorkerCommand returns the raw worker command string. Same
+// wrapping/injection contract as generateLeaderCommand.
+func generateWorkerCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel) (string, error) {
+	switch getArksApplicationRuntime(application) {
 	case string(arksv1.ArksRuntimeVLLM):
-		command := []string{"/bin/bash", "-c", "/bin/bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS)"}
-		return command, nil
+		return "/bin/bash /vllm-workspace/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS)", nil
 	case string(arksv1.ArksRuntimeSGLang):
 		args := "python3 -m sglang.launch_server --dist-init-addr $(LWS_LEADER_ADDRESS):20000 --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) --trust-remote-code"
 		args = fmt.Sprintf("%s --model-path %s", args, generateModelPath(model))
 		args = fmt.Sprintf("%s --served-model-name %s", args, getServedModelName(application))
-		if application.Spec.TensorParallelSize > 0 {
-			args = fmt.Sprintf("%s --tp %d", args, application.Spec.TensorParallelSize)
-		}
-		for i := range application.Spec.RuntimeCommonArgs {
-			args = fmt.Sprintf("%s %s", args, application.Spec.RuntimeCommonArgs[i])
+		for _, arg := range unifiedRuntimeCommonArgs(application) {
+			args = fmt.Sprintf("%s %s", args, arg)
 		}
 		if !strings.Contains(args, "enable-metrics") {
 			args = fmt.Sprintf("%s --enable-metrics", args)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	case string(arksv1.ArksRuntimeDynamo):
 		args := fmt.Sprintf("dynamo run in=dyn://$(LWS_LEADER_ADDRESS) out=vllm %s", generateModelPath(model))
 		args = fmt.Sprintf("%s --model-name %s", args, getServedModelName(application))
-		for i := range application.Spec.RuntimeCommonArgs {
-			args = fmt.Sprintf("%s %s", args, application.Spec.RuntimeCommonArgs[i])
+		for _, arg := range unifiedRuntimeCommonArgs(application) {
+			args = fmt.Sprintf("%s %s", args, arg)
 		}
-		return []string{"/bin/bash", "-c", args}, nil
+		return args, nil
 	default:
-		// never reach here
-		return nil, fmt.Errorf("runtime not support")
+		return "", fmt.Errorf("runtime not support")
 	}
 }
 
-func getServedModelName(application *arksv1.ArksApplication) string {
-	servedModelName := application.Spec.Model.Name
-	if application.Spec.ServedModelName != "" {
-		servedModelName = application.Spec.ServedModelName
+func (r *ArksApplicationReconciler) generateDisaggregationLeaderCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel, roleName string) (string, error) {
+	workload := application.Spec.Prefill
+	if roleName == "decode" {
+		workload = application.Spec.Decode
 	}
-	return servedModelName
+	if workload == nil {
+		return "", fmt.Errorf("%s workload is required", roleName)
+	}
+
+	switch getArksApplicationRuntime(application) {
+	case string(arksv1.ArksRuntimeSGLang):
+		args := "python3 -m sglang.launch_server --dist-init-addr $(LWS_LEADER_ADDRESS):20000 --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) --trust-remote-code --host 0.0.0.0 --port 8080"
+		for _, arg := range workload.RuntimeCommonArgs {
+			args = fmt.Sprintf("%s %s", args, arg)
+		}
+		if !strings.Contains(args, "--model-path") {
+			args = fmt.Sprintf("%s --model-path %s", args, generateModelPath(model))
+		}
+		if !strings.Contains(args, "--served-model-name") {
+			args = fmt.Sprintf("%s --served-model-name %s", args, getServedModelName(application))
+		}
+		if !strings.Contains(args, "--disaggregation-mode") {
+			args = fmt.Sprintf("%s --disaggregation-mode %s", args, roleName)
+		}
+		if !strings.Contains(args, "--enable-metrics") {
+			args = fmt.Sprintf("%s --enable-metrics", args)
+		}
+		return args, nil
+	default:
+		return "", errors.New("unsupported runtime for disaggregated mode")
+	}
+}
+
+func (r *ArksApplicationReconciler) generateDisaggregationWorkerCommand(application *arksv1.ArksApplication, model *arksv1.ArksModel, roleName string) (string, error) {
+	workload := application.Spec.Prefill
+	if roleName == "decode" {
+		workload = application.Spec.Decode
+	}
+	if workload == nil {
+		return "", fmt.Errorf("%s workload is required", roleName)
+	}
+
+	switch getArksApplicationRuntime(application) {
+	case string(arksv1.ArksRuntimeSGLang):
+		args := "python3 -m sglang.launch_server --dist-init-addr $(LWS_LEADER_ADDRESS):20000 --nnodes $(LWS_GROUP_SIZE) --node-rank $(LWS_WORKER_INDEX) --trust-remote-code"
+		args = fmt.Sprintf("%s --model-path %s", args, generateModelPath(model))
+		args = fmt.Sprintf("%s --served-model-name %s", args, getServedModelName(application))
+		args = fmt.Sprintf("%s --disaggregation-mode %s", args, roleName)
+		for _, arg := range workload.RuntimeCommonArgs {
+			args = fmt.Sprintf("%s %s", args, arg)
+		}
+		if !strings.Contains(args, "--enable-metrics") {
+			args = fmt.Sprintf("%s --enable-metrics", args)
+		}
+		return args, nil
+	default:
+		return "", errors.New("unsupported runtime for disaggregated mode")
+	}
+}
+
+func (r *ArksApplicationReconciler) generateRouterCommand(application *arksv1.ArksApplication, port, metricPort int32) (string, error) {
+	if getArksApplicationRuntime(application) != string(arksv1.ArksRuntimeSGLang) {
+		return "", errors.New("router is only supported with runtime=sglang")
+	}
+
+	var args string
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated {
+		args = fmt.Sprintf("python3 -m sglang_router.launch_router --pd-disaggregation --service-discovery --service-discovery-port 8080 --host 0.0.0.0 --port %d", port)
+		args = fmt.Sprintf("%s --service-discovery-namespace %s", args, application.Namespace)
+		args = fmt.Sprintf("%s --prefill-selector", args)
+		prefillLabels := generateDisaggregatedSelectorLabels(application, "prefill")
+		for _, key := range sortedKeys(prefillLabels) {
+			args = fmt.Sprintf("%s %s=%s", args, key, prefillLabels[key])
+		}
+		args = fmt.Sprintf("%s --decode-selector", args)
+		decodeLabels := generateDisaggregatedSelectorLabels(application, "decode")
+		for _, key := range sortedKeys(decodeLabels) {
+			args = fmt.Sprintf("%s %s=%s", args, key, decodeLabels[key])
+		}
+	} else {
+		args = fmt.Sprintf("python3 -m sglang_router.launch_router --service-discovery --service-discovery-port 8080 --host 0.0.0.0 --port %d", port)
+		args = fmt.Sprintf("%s --service-discovery-namespace %s", args, application.Namespace)
+		args = fmt.Sprintf("%s --selector", args)
+		unifiedLabels := applicationUnifiedSelector(application)
+		for _, key := range sortedKeys(unifiedLabels) {
+			args = fmt.Sprintf("%s %s=%s", args, key, unifiedLabels[key])
+		}
+	}
+
+	for _, arg := range application.Spec.Router.RouterArgs {
+		args = fmt.Sprintf("%s %s", args, arg)
+	}
+	if !strings.Contains(args, "-policy") {
+		args = fmt.Sprintf("%s --policy cache_aware", args)
+	}
+	if !strings.Contains(args, "prometheus-port") {
+		args = fmt.Sprintf("%s --prometheus-host 0.0.0.0", args)
+		args = fmt.Sprintf("%s --prometheus-port %d", args, metricPort)
+	}
+	return args, nil
+}
+
+func getServedModelName(application *arksv1.ArksApplication) string {
+	if application.Spec.ServedModelName != "" {
+		return application.Spec.ServedModelName
+	}
+	return application.Spec.Model.Name
 }
 
 func (r *ArksApplicationReconciler) patchApplicationStatus(ctx context.Context, original, updated *arksv1.ArksApplication) error {
@@ -1031,7 +1584,6 @@ func (r *ArksApplicationReconciler) patchApplicationStatus(ctx context.Context, 
 		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(updated), current); err != nil {
 			return client.IgnoreNotFound(err)
 		}
-
 		current.Status = updated.Status
 		return r.Client.Status().Update(ctx, current)
 	})
@@ -1043,17 +1595,29 @@ func (r *ArksApplicationReconciler) removeFinalizerWithRetry(ctx context.Context
 		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(application), current); err != nil {
 			return client.IgnoreNotFound(err)
 		}
-
 		if !hasFinalizer(current, arksApplicationControllerFinalizer) {
 			return nil
 		}
-
 		removeFinalizer(current, arksApplicationControllerFinalizer)
 		return r.Client.Update(ctx, current)
 	})
 }
 
-func getStandaloneApplicationRuntime(application *arksv1.ArksApplication) string {
+func getApplicationMode(application *arksv1.ArksApplication) arksv1.ArksApplicationMode {
+	if application.Spec.Mode == "" {
+		return arksv1.ArksApplicationModeUnified
+	}
+	return application.Spec.Mode
+}
+
+func isApplicationRouterRequested(application *arksv1.ArksApplication) bool {
+	if getApplicationMode(application) == arksv1.ArksApplicationModeDisaggregated {
+		return true
+	}
+	return application.Spec.Router != nil
+}
+
+func getArksApplicationRuntime(application *arksv1.ArksApplication) string {
 	if application.Spec.Runtime == "" {
 		return string(arksv1.ArksRuntimeDefault)
 	}
@@ -1087,50 +1651,33 @@ func (r *ArksApplicationReconciler) requestsForModel(ctx context.Context, obj cl
 	return requests
 }
 
-// requestsForRBG maps RBG changes to Application reconcile requests
 func (r *ArksApplicationReconciler) requestsForRBG(ctx context.Context, obj client.Object) []ctrl.Request {
 	rbg, ok := obj.(*rbgv1alpha1.RoleBasedGroup)
 	if !ok {
 		return nil
 	}
 
-	// Get RBGS from RBG's owner reference
 	rbgsRef := metav1.GetControllerOf(rbg)
 	if rbgsRef == nil || rbgsRef.Kind != "RoleBasedGroupSet" {
-		// RBG not owned by RBGS, skip
 		return nil
 	}
 
-	// Fetch the RBGS object
 	rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
-	if err := r.Client.Get(ctx, types.NamespacedName{
-		Name:      rbgsRef.Name,
-		Namespace: rbg.Namespace,
-	}, rbgs); err != nil {
-		if !apierrors.IsNotFound(err) {
-			klog.V(4).Infof("failed to get RBGS %s/%s for RBG %s: %v", rbg.Namespace, rbgsRef.Name, rbg.Name, err)
-		}
-		// RBGS not found means it's being deleted, RBG will be garbage collected
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: rbgsRef.Name, Namespace: rbg.Namespace}, rbgs); err != nil {
 		return nil
 	}
 
-	// Get Application from RBGS's owner reference
 	appRef := metav1.GetControllerOf(rbgs)
 	if appRef == nil || appRef.Kind != "ArksApplication" {
-		// RBGS not owned by ArksApplication, skip
 		return nil
 	}
 
-	klog.V(5).Infof("RBG %s/%s changed, triggering reconciliation for application %s", rbg.Namespace, rbg.Name, appRef.Name)
-
-	return []ctrl.Request{
-		{
-			NamespacedName: types.NamespacedName{
-				Name:      appRef.Name,
-				Namespace: rbg.Namespace,
-			},
+	return []ctrl.Request{{
+		NamespacedName: types.NamespacedName{
+			Name:      appRef.Name,
+			Namespace: rbg.Namespace,
 		},
-	}
+	}}
 }
 
 func checkApplicationCondition(application *arksv1.ArksApplication, conditionType arksv1.ArksApplicationConditionType) bool {
@@ -1166,48 +1713,52 @@ func initializeApplicationCondition(application *arksv1.ArksApplication) {
 	if application.Status.Conditions != nil {
 		return
 	}
-	application.Status.Conditions = append(application.Status.Conditions, arksv1.ArksApplicationCondition{
-		Type:               arksv1.ArksApplicationPrecheck,
-		Status:             corev1.ConditionFalse,
-		Reason:             "NewIncomming",
-		Message:            "Wait the controller to check the application",
-		LastTransitionTime: metav1.Now(),
-	})
-	application.Status.Conditions = append(application.Status.Conditions, arksv1.ArksApplicationCondition{
-		Type:               arksv1.ArksApplicationLoaded,
-		Status:             corev1.ConditionFalse,
-		Reason:             "NewIncomming",
-		Message:            "Wait the controller to load the model",
-		LastTransitionTime: metav1.Now(),
-	})
-	application.Status.Conditions = append(application.Status.Conditions, arksv1.ArksApplicationCondition{
-		Type:               arksv1.ArksApplicationReady,
-		Status:             corev1.ConditionFalse,
-		Reason:             "NewIncomming",
-		Message:            "Wait the controller to check the application status",
-		LastTransitionTime: metav1.Now(),
-	})
+	application.Status.Conditions = []arksv1.ArksApplicationCondition{
+		{
+			Type:               arksv1.ArksApplicationPrecheck,
+			Status:             corev1.ConditionFalse,
+			Reason:             "NewIncomming",
+			Message:            "Wait the controller to check the application",
+			LastTransitionTime: metav1.Now(),
+		},
+		{
+			Type:               arksv1.ArksApplicationLoaded,
+			Status:             corev1.ConditionFalse,
+			Reason:             "NewIncomming",
+			Message:            "Wait the controller to load the model",
+			LastTransitionTime: metav1.Now(),
+		},
+		{
+			Type:               arksv1.ArksApplicationReady,
+			Status:             corev1.ConditionFalse,
+			Reason:             "NewIncomming",
+			Message:            "Wait the controller to check the application status",
+			LastTransitionTime: metav1.Now(),
+		},
+		{
+			Type:               arksv1.ArksApplicationTrafficTargetReady,
+			Status:             corev1.ConditionFalse,
+			Reason:             "NewIncomming",
+			Message:            "Wait the controller to route traffic to a ready target",
+			LastTransitionTime: metav1.Now(),
+		},
+	}
 }
 
-// determineBackend detects backend based on existing resources
-func (r *ArksApplicationReconciler) determineBackend(
-	ctx context.Context,
-	namespace string,
-	name string,
-) arksv1.ArksBackend {
-	// Check if LWS exists
-	if r.LWSClient != nil {
-		if _, err := r.LWSClient.LeaderworkersetV1().LeaderWorkerSets(namespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
-			return arksv1.ArksBackendLWS
-		}
+func generateDisaggregatedSelectorLabels(application *arksv1.ArksApplication, roleName string) map[string]string {
+	return map[string]string{
+		arksv1.ArksControllerKeyApplication:  application.Name,
+		arksv1.ArksControllerKeyModel:        application.Spec.Model.Name,
+		arksv1.ArksControllerKeyRole:         roleName,
+		arksv1.ArksControllerKeyWorkLoadRole: arksv1.ArksWorkLoadRoleLeader,
 	}
+}
 
-	// Check if RBGS exists
-	rbgs := &rbgv1alpha1.RoleBasedGroupSet{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, rbgs); err == nil {
-		return arksv1.ArksBackendRBG
+func sortedKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
 	}
-
-	// Default to RBG
-	return arksv1.ArksBackendRBG
+	sort.Strings(keys)
+	return keys
 }

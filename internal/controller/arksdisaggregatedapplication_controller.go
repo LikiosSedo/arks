@@ -921,16 +921,19 @@ func (r *ArksDisaggregatedApplicationReconciler) buildSchedulerRole(ctx context.
 		RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
 			Type: rbgv1alpha1.RollingUpdateStrategyType,
 			RollingUpdate: &rbgv1alpha1.RollingUpdate{
-				MaxUnavailable: intstr.FromInt(1),
-				MaxSurge:       intstr.FromInt(0),
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				MaxSurge:       ptr.To(intstr.FromInt(0)),
+				Partition:      ptr.To(intstr.FromInt(0)),
 			},
 		},
-		Template: corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Annotations: application.Spec.Router.InstanceSpec.Annotations,
-				Labels:      r.generateRouterLabels(application),
+		TemplateSource: rbgv1alpha1.TemplateSource{
+			Template: &corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: application.Spec.Router.InstanceSpec.Annotations,
+					Labels:      r.generateRouterLabels(application),
+				},
+				Spec: podSpec,
 			},
-			Spec: podSpec,
 		},
 	}
 
@@ -1103,26 +1106,28 @@ func (r *ArksDisaggregatedApplicationReconciler) buildWorkloadRole(application *
 			APIVersion: "leaderworkerset.x-k8s.io/v1",
 			Kind:       "LeaderWorkerSet",
 		},
-		LeaderWorkerSet: rbgv1alpha1.LeaderWorkerTemplate{
+		LeaderWorkerSet: &rbgv1alpha1.LeaderWorkerTemplate{
 			Size: ptr.To(int32(size)),
-			PatchLeaderTemplate: runtime.RawExtension{
+			PatchLeaderTemplate: &runtime.RawExtension{
 				Raw: leaderPatchJSON,
 			},
 		},
 		RolloutStrategy: &rbgv1alpha1.RolloutStrategy{
 			Type: rbgv1alpha1.RollingUpdateStrategyType,
 			RollingUpdate: &rbgv1alpha1.RollingUpdate{
-				MaxUnavailable: intstr.FromInt(1),
-				MaxSurge:       intstr.FromInt(0),
-				Partition:      ptr.To(int32(0)),
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
+				MaxSurge:       ptr.To(intstr.FromInt(0)),
+				Partition:      ptr.To(intstr.FromInt(0)),
 			},
 		},
-		Template: corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Annotations: workload.InstanceSpec.Annotations,
-				Labels:      generateLabels(application, arksv1.ArksWorkLoadRoleWorker),
+		TemplateSource: rbgv1alpha1.TemplateSource{
+			Template: &corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: workload.InstanceSpec.Annotations,
+					Labels:      generateLabels(application, arksv1.ArksWorkLoadRoleWorker),
+				},
+				Spec: podSpec,
 			},
-			Spec: podSpec,
 		},
 	}
 
@@ -1143,7 +1148,9 @@ func (r *ArksDisaggregatedApplicationReconciler) reconcileUnified(ctx context.Co
 		if err != nil {
 			return err
 		}
-		rbgs.Spec = desired.Spec
+		if !rbgsSpecSemanticallyEqual(rbgs.Spec, desired.Spec) {
+			rbgs.Spec = desired.Spec
+		}
 		rbgs.Labels = desired.Labels
 		return controllerutil.SetControllerReference(application, rbgs, r.Scheme)
 	})
