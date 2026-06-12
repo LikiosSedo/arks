@@ -258,6 +258,16 @@ func (r *ArksApplicationReconciler) validate(application *arksv1.ArksApplication
 		if hasPrefill == hasPrefillGroups {
 			return fmt.Errorf("exactly one of prefill or prefillGroups is required when mode=disaggregated")
 		}
+		// The CRD enforces uniqueness via listMapKey=name; re-check here so
+		// programmatic paths that bypass API validation cannot generate
+		// duplicate RBG roles.
+		groupNames := map[string]bool{}
+		for _, group := range application.Spec.PrefillGroups {
+			if groupNames[group.Name] {
+				return fmt.Errorf("duplicate prefill group name %q", group.Name)
+			}
+			groupNames[group.Name] = true
+		}
 		if application.Spec.Decode == nil {
 			return fmt.Errorf("decode spec is required when mode=disaggregated")
 		}

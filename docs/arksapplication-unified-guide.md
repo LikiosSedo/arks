@@ -211,6 +211,11 @@ Rules and behavior:
   applications keep working unchanged (and keep their workload names, so an
   upgrade does not recreate pods).
 - Group names must be DNS-1123 labels (max 24 chars) and unique.
+- Name budget: derived workload names follow `<app>-prefill-<group>` (plus
+  pod suffixes added by LWS), and Kubernetes caps DNS labels at 63
+  characters. With a long application name plus a long group name the
+  derived names can exceed the cap, so keep `len(app) + len(group)` roughly
+  under 40 characters.
 - Every group's pods carry the shared `arks.ai/role=prefill` label (so the
   router's service discovery matches all groups as one pool) plus
   `arks.ai/worker-group=<name>` for group-aware routing policies.

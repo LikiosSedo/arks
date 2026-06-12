@@ -229,4 +229,15 @@ func TestValidatePrefillGroupsExclusive(t *testing.T) {
 	if err := r.validate(app); err != nil {
 		t.Fatalf("validate should pass with prefill only, got: %v", err)
 	}
+
+	// duplicate group names: reject even though the CRD's listMapKey would
+	// normally block this at admission (defense in depth for programmatic
+	// paths).
+	app = newTestDisaggregatedApplication()
+	app.Spec.PrefillGroups = []arksv1.ArksApplicationWorkloadGroup{group, group}
+	if err := r.validate(app); err == nil {
+		t.Fatal("expected validate error for duplicate prefill group names")
+	} else if !strings.Contains(err.Error(), "duplicate prefill group name") {
+		t.Fatalf("error should mention duplicate group name, got: %v", err)
+	}
 }
